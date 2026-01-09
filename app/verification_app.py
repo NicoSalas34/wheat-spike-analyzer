@@ -7,12 +7,21 @@ de l'analyse des épis de blé.
 
 Raccourcis clavier:
     ← / → : Image précédente / suivante
-    V     : Valider l'image courante
+    V     : Valider l'image courante (ajoute tag "Validé")
     R     : Rejeter l'image courante
-    E     : Éditer les valeurs
     S     : Sauvegarder les corrections
     F     : Filtrer (non validés seulement)
-    1-9   : Aller à l'épi N pour correction
+    T     : Focus sur les tags
+    1-9   : Toggle tag rapide
+
+Tags prédéfinis:
+    - Validé : Tout est correct
+    - Règle non détectée
+    - Épi mal détecté
+    - Sachet illisible
+    - Épillets incorrects
+    - Image floue
+    - Plusieurs épis confondus
 
 Usage:
     python app/verification_app.py --output output/
@@ -20,14 +29,16 @@ Usage:
 """
 
 import argparse
+import csv
 import json
 import logging
 import os
 from datetime import datetime
+from io import StringIO
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from flask import Flask, jsonify, render_template_string, request, send_file
+from flask import Flask, Response, jsonify, render_template_string, request, send_file
 
 # Configuration logging
 logging.basicConfig(level=logging.INFO)
@@ -39,6 +50,18 @@ app = Flask(__name__)
 RESULTS_DIR = None
 RESULTS_CACHE = {}
 CORRECTIONS_FILE = None
+
+# Tags prédéfinis pour les problèmes
+PREDEFINED_TAGS = [
+    {"id": "validated", "label": "✓ Validé", "color": "#4ade80", "shortcut": "1"},
+    {"id": "ruler_missing", "label": "Règle non détectée", "color": "#f87171", "shortcut": "2"},
+    {"id": "spike_wrong", "label": "Épi mal détecté", "color": "#fb923c", "shortcut": "3"},
+    {"id": "bag_unreadable", "label": "Sachet illisible", "color": "#fbbf24", "shortcut": "4"},
+    {"id": "spikelets_wrong", "label": "Épillets incorrects", "color": "#a78bfa", "shortcut": "5"},
+    {"id": "blurry", "label": "Image floue", "color": "#60a5fa", "shortcut": "6"},
+    {"id": "multiple_spikes", "label": "Plusieurs épis confondus", "color": "#f472b6", "shortcut": "7"},
+    {"id": "calibration_wrong", "label": "Calibration incorrecte", "color": "#94a3b8", "shortcut": "8"},
+]
 
 
 def load_all_results() -> List[Dict]:
@@ -58,13 +81,15 @@ def load_all_results() -> List[Dict]:
             data['_session_dir'] = str(session_dir)
             data['_results_file'] = str(results_file)
             
-            # Charger les corrections si existantes
-            corrections_file = session_dir / 'corrections.json'
-            if corrections_file.exists():
-                with open(corrections_file, 'r') as f:
-                    data['_corrections'] = json.load(f)
+            # Charger la vérification existante si présente
+            if '_verification' in data:
+                data['_corrections'] = {
+                    'status': data['_verification'].get('status', 'pending'),
+                    'tags': data['_verification'].get('tags', []),
+                    'notes': data['_verification'].get('notes', ''),
+                }
             else:
-                data['_corrections'] = {}
+                data['_corrections'] = {'status': 'pending', 'tags': []}
             
             results.append(data)
         except Exception as e:
@@ -77,27 +102,58 @@ def load_all_results() -> List[Dict]:
 
 
 def save_correction(image_id: str, corrections: Dict) -> bool:
-    """Sauvegarde les corrections pour une image"""
+    """Sauvegarde les corrections directement dans results.json"""
     if image_id not in RESULTS_CACHE:
         return False
     
     result = RESULTS_CACHE[image_id]
-    session_dir = Path(result['_session_dir'])
+    results_file = Path(result['_results_file'])
     
-    # Fusionner avec les corrections existantes
-    existing = result.get('_corrections', {})
-    existing.update(corrections)
-    existing['_last_modified'] = datetime.now().isoformat()
+    # Mettre à jour le résultat avec les corrections
+    result['_verification'] = {
+        'status': corrections.get('status', 'pending'),
+        'tags': corrections.get('tags', []),
+        'notes': corrections.get('notes', ''),
+        'verified_at': datetime.now().isoformat(),
+        'verified_by': 'verification_app'
+    }
     
-    # Sauvegarder
-    corrections_file = session_dir / 'corrections.json'
-    with open(corrections_file, 'w') as f:
-        json.dump(existing, f, indent=2)
+    # Mettre à jour les valeurs corrigées
+    if corrections.get('sample_id'):
+        if 'bag' not in result:
+            result['bag'] = {}
+        result['bag']['sample_id_corrected'] = corrections['sample_id']
     
-    # Mettre à jour le cache
-    RESULTS_CACHE[image_id]['_corrections'] = existing
+    # Corrections des épis
+    for key, value in corrections.items():
+        if key.startswith('spike_') and '_' in key[6:]:
+            parts = key.split('_')
+            if len(parts) >= 3:
+                spike_idx = int(parts[1])
+                field = '_'.join(parts[2:])
+                
+                if 'spikes' in result and spike_idx < len(result['spikes']):
+                    if 'corrections' not in result['spikes'][spike_idx]:
+                        result['spikes'][spike_idx]['corrections'] = {}
+                    result['spikes'][spike_idx]['corrections'][field] = value
     
-    return True
+    # Sauvegarder le fichier results.json modifié
+    try:
+        # Créer une copie sans les clés internes pour la sauvegarde
+        save_data = {k: v for k, v in result.items() if not k.startswith('_') or k == '_verification'}
+        
+        with open(results_file, 'w') as f:
+            json.dump(save_data, f, indent=2, default=str)
+        
+        # Mettre à jour le cache
+        RESULTS_CACHE[image_id].update(result)
+        
+        logger.info(f"Sauvegardé: {results_file}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Erreur sauvegarde {results_file}: {e}")
+        return False
 
 
 def get_debug_image_path(session_dir: str, image_type: str = 'final') -> Optional[str]:
@@ -162,7 +218,7 @@ HTML_TEMPLATE = """
         
         .nav-info {
             display: flex;
-            gap: 20px;
+            gap: 15px;
             align-items: center;
         }
         
@@ -173,17 +229,30 @@ HTML_TEMPLATE = """
             font-size: 0.9rem;
         }
         
-        .filter-btn {
+        .header-btn {
             background: #0f3460;
             border: none;
             color: #eee;
             padding: 8px 15px;
             border-radius: 5px;
             cursor: pointer;
+            font-size: 0.85rem;
         }
         
-        .filter-btn.active {
+        .header-btn:hover {
+            background: #1a4a80;
+        }
+        
+        .header-btn.active {
             background: #e94560;
+        }
+        
+        .header-btn.export {
+            background: #10b981;
+        }
+        
+        .header-btn.export:hover {
+            background: #059669;
         }
         
         /* Main content */
@@ -241,30 +310,31 @@ HTML_TEMPLATE = """
         .info-panel {
             flex: 1;
             background: #16213e;
-            padding: 20px;
+            padding: 15px;
             overflow-y: auto;
-            min-width: 350px;
-            max-width: 400px;
+            min-width: 380px;
+            max-width: 420px;
         }
         
         .section {
             background: #0f3460;
             border-radius: 8px;
-            padding: 15px;
-            margin-bottom: 15px;
+            padding: 12px;
+            margin-bottom: 12px;
         }
         
         .section h3 {
             color: #e94560;
             margin-bottom: 10px;
-            font-size: 0.9rem;
+            font-size: 0.85rem;
             text-transform: uppercase;
         }
         
         .info-row {
             display: flex;
             justify-content: space-between;
-            padding: 5px 0;
+            align-items: center;
+            padding: 4px 0;
             border-bottom: 1px solid #1a1a3e;
         }
         
@@ -274,6 +344,7 @@ HTML_TEMPLATE = """
         
         .info-label {
             color: #888;
+            font-size: 0.9rem;
         }
         
         .info-value {
@@ -300,12 +371,81 @@ HTML_TEMPLATE = """
             outline: none;
         }
         
+        /* Tags */
+        .tags-container {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            margin-top: 8px;
+        }
+        
+        .tag {
+            display: inline-flex;
+            align-items: center;
+            padding: 4px 10px;
+            border-radius: 15px;
+            font-size: 0.75rem;
+            cursor: pointer;
+            border: 2px solid transparent;
+            transition: all 0.2s;
+            opacity: 0.5;
+        }
+        
+        .tag:hover {
+            opacity: 0.8;
+        }
+        
+        .tag.active {
+            opacity: 1;
+            border-color: white;
+            box-shadow: 0 0 8px rgba(255,255,255,0.3);
+        }
+        
+        .tag-shortcut {
+            background: rgba(0,0,0,0.3);
+            padding: 1px 5px;
+            border-radius: 3px;
+            margin-right: 5px;
+            font-size: 0.7rem;
+        }
+        
+        .custom-tag-input {
+            background: #1a1a3e;
+            border: 1px dashed #555;
+            color: #eee;
+            padding: 4px 10px;
+            border-radius: 15px;
+            font-size: 0.75rem;
+            width: 120px;
+        }
+        
+        .custom-tag-input::placeholder {
+            color: #666;
+        }
+        
+        /* Active tags display */
+        .active-tags {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+            margin-top: 8px;
+        }
+        
+        .active-tag {
+            display: inline-flex;
+            align-items: center;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 0.7rem;
+            color: #000;
+        }
+        
         /* Spike list */
         .spike-item {
             background: #1a1a3e;
             border-radius: 5px;
-            padding: 10px;
-            margin-bottom: 8px;
+            padding: 8px;
+            margin-bottom: 6px;
         }
         
         .spike-header {
@@ -317,21 +457,22 @@ HTML_TEMPLATE = """
         .spike-id {
             color: #e94560;
             font-weight: bold;
+            font-size: 0.9rem;
         }
         
         /* Actions */
         .actions {
             display: flex;
-            gap: 10px;
-            margin-top: 20px;
+            gap: 8px;
+            margin-top: 12px;
         }
         
         .btn {
             flex: 1;
-            padding: 12px;
+            padding: 10px;
             border: none;
             border-radius: 5px;
-            font-size: 1rem;
+            font-size: 0.9rem;
             cursor: pointer;
             transition: transform 0.1s, opacity 0.2s;
         }
@@ -380,15 +521,15 @@ HTML_TEMPLATE = """
             background: rgba(0,0,0,0.8);
             padding: 10px 15px;
             border-radius: 5px;
-            font-size: 0.75rem;
+            font-size: 0.7rem;
             color: #888;
         }
         
         .shortcuts kbd {
             background: #333;
-            padding: 2px 6px;
+            padding: 2px 5px;
             border-radius: 3px;
-            margin-right: 5px;
+            margin-right: 3px;
         }
         
         /* Loading */
@@ -436,8 +577,11 @@ HTML_TEMPLATE = """
     <div class="header">
         <h1>🌾 Wheat Spike Analyzer - Vérification</h1>
         <div class="nav-info">
-            <button class="filter-btn" id="filterBtn" onclick="toggleFilter()">
+            <button class="header-btn" id="filterBtn" onclick="toggleFilter()">
                 Afficher tous
+            </button>
+            <button class="header-btn export" onclick="regenerateCSV()">
+                📊 Régénérer CSV
             </button>
             <div class="counter">
                 <span id="currentIndex">0</span> / <span id="totalCount">0</span>
@@ -466,6 +610,16 @@ HTML_TEMPLATE = """
                     <span class="info-label">Statut</span>
                     <span id="statusBadge" class="status-badge status-pending">En attente</span>
                 </div>
+                <div id="activeTagsDisplay" class="active-tags"></div>
+            </div>
+            
+            <div class="section">
+                <h3>🏷️ Tags (1-8 pour toggle)</h3>
+                <div class="tags-container" id="tagsContainer"></div>
+                <div style="margin-top:8px;">
+                    <input type="text" class="custom-tag-input" id="customTag" 
+                           placeholder="+ Tag personnalisé" onkeypress="addCustomTag(event)">
+                </div>
             </div>
             
             <div class="section">
@@ -484,7 +638,7 @@ HTML_TEMPLATE = """
                 <h3>🏷️ Identification</h3>
                 <div class="info-row">
                     <span class="info-label">ID Sachet</span>
-                    <input type="text" class="editable" id="sampleId" placeholder="?-?-?">
+                    <input type="text" class="editable" id="sampleId" placeholder="?-?-?" style="width:100px;">
                 </div>
                 <div class="info-row">
                     <span class="info-label">Confiance</span>
@@ -499,11 +653,11 @@ HTML_TEMPLATE = """
             
             <div class="section">
                 <h3>📝 Notes</h3>
-                <textarea id="notes" style="width:100%; height:60px; background:#1a1a3e; border:1px solid #333; color:#eee; border-radius:5px; padding:8px; resize:vertical;"></textarea>
+                <textarea id="notes" style="width:100%; height:50px; background:#1a1a3e; border:1px solid #333; color:#eee; border-radius:5px; padding:8px; resize:vertical; font-size:0.85rem;"></textarea>
             </div>
             
             <div class="actions">
-                <button class="btn btn-validate" onclick="setStatus('validated')">
+                <button class="btn btn-validate" onclick="validateWithTag()">
                     ✓ Valider (V)
                 </button>
                 <button class="btn btn-reject" onclick="setStatus('rejected')">
@@ -519,21 +673,26 @@ HTML_TEMPLATE = """
     </div>
     
     <div class="shortcuts">
-        <kbd>←</kbd><kbd>→</kbd> Navigation
+        <kbd>←</kbd><kbd>→</kbd> Nav
         <kbd>V</kbd> Valider
         <kbd>R</kbd> Rejeter
-        <kbd>S</kbd> Sauvegarder
-        <kbd>F</kbd> Filtrer
+        <kbd>S</kbd> Sauver
+        <kbd>F</kbd> Filtre
+        <kbd>1-8</kbd> Tags
     </div>
     
     <div class="loading" id="loading">Chargement...</div>
     <div class="toast" id="toast"></div>
 
     <script>
+        // Tags prédéfinis (depuis le serveur)
+        const PREDEFINED_TAGS = {{ predefined_tags | safe }};
+        
         let results = [];
         let filteredResults = [];
         let currentIndex = 0;
         let filterPending = false;
+        let currentTags = [];
         
         // Charger les résultats au démarrage
         async function loadResults() {
@@ -542,6 +701,7 @@ HTML_TEMPLATE = """
                 const response = await fetch('/api/results');
                 results = await response.json();
                 applyFilter();
+                renderTags();
                 if (filteredResults.length > 0) {
                     displayResult(0);
                 }
@@ -550,6 +710,65 @@ HTML_TEMPLATE = """
                 showToast('Erreur de chargement', 'error');
             }
             showLoading(false);
+        }
+        
+        function renderTags() {
+            const container = document.getElementById('tagsContainer');
+            container.innerHTML = PREDEFINED_TAGS.map(tag => `
+                <div class="tag" id="tag_${tag.id}" 
+                     style="background:${tag.color}; color:#000;"
+                     onclick="toggleTag('${tag.id}')">
+                    <span class="tag-shortcut">${tag.shortcut}</span>
+                    ${tag.label}
+                </div>
+            `).join('');
+        }
+        
+        function toggleTag(tagId) {
+            const idx = currentTags.indexOf(tagId);
+            if (idx >= 0) {
+                currentTags.splice(idx, 1);
+            } else {
+                // Si on ajoute "validated", on retire les autres problèmes
+                if (tagId === 'validated') {
+                    currentTags = ['validated'];
+                } else {
+                    // Si on ajoute un problème, on retire "validated"
+                    currentTags = currentTags.filter(t => t !== 'validated');
+                    currentTags.push(tagId);
+                }
+            }
+            updateTagDisplay();
+        }
+        
+        function updateTagDisplay() {
+            // Mettre à jour les badges de tags
+            PREDEFINED_TAGS.forEach(tag => {
+                const el = document.getElementById(`tag_${tag.id}`);
+                if (el) {
+                    el.classList.toggle('active', currentTags.includes(tag.id));
+                }
+            });
+            
+            // Afficher les tags actifs
+            const display = document.getElementById('activeTagsDisplay');
+            display.innerHTML = currentTags.map(tagId => {
+                const tag = PREDEFINED_TAGS.find(t => t.id === tagId) || {label: tagId, color: '#666'};
+                return `<span class="active-tag" style="background:${tag.color}">${tag.label}</span>`;
+            }).join('');
+        }
+        
+        function addCustomTag(event) {
+            if (event.key === 'Enter') {
+                const input = document.getElementById('customTag');
+                const tag = input.value.trim();
+                if (tag && !currentTags.includes(tag)) {
+                    currentTags = currentTags.filter(t => t !== 'validated');
+                    currentTags.push(tag);
+                    updateTagDisplay();
+                }
+                input.value = '';
+            }
         }
         
         function applyFilter() {
@@ -566,7 +785,7 @@ HTML_TEMPLATE = """
         function toggleFilter() {
             filterPending = !filterPending;
             document.getElementById('filterBtn').textContent = 
-                filterPending ? 'Non validés uniquement' : 'Afficher tous';
+                filterPending ? 'Non validés' : 'Afficher tous';
             document.getElementById('filterBtn').classList.toggle('active', filterPending);
             applyFilter();
             displayResult(currentIndex);
@@ -595,6 +814,10 @@ HTML_TEMPLATE = """
             // Status
             updateStatusBadge(corrections.status || 'pending');
             
+            // Tags
+            currentTags = corrections.tags || [];
+            updateTagDisplay();
+            
             // Calibration
             const cal = result.calibration || {};
             document.getElementById('rulerDetected').textContent = cal.ruler_detected ? '✓ Oui' : '✗ Non';
@@ -604,7 +827,7 @@ HTML_TEMPLATE = """
             
             // Bag
             const bag = result.bag || {};
-            document.getElementById('sampleId').value = corrections.sample_id || bag.sample_id || '';
+            document.getElementById('sampleId').value = bag.sample_id_corrected || bag.sample_id || '';
             document.getElementById('bagConfidence').textContent = bag.confidence ? 
                 `${(bag.confidence * 100).toFixed(0)}%` : '-';
             
@@ -615,8 +838,7 @@ HTML_TEMPLATE = """
             const spikeList = document.getElementById('spikeList');
             spikeList.innerHTML = spikes.map((spike, i) => {
                 const m = spike.measurements || {};
-                const correctedLength = corrections[`spike_${i}_length`];
-                const correctedSpikelets = corrections[`spike_${i}_spikelets`];
+                const corr = spike.corrections || {};
                 
                 return `
                     <div class="spike-item">
@@ -627,14 +849,14 @@ HTML_TEMPLATE = """
                             <span class="info-label">Longueur</span>
                             <input type="number" step="0.1" class="editable" 
                                    id="spike_${i}_length"
-                                   value="${correctedLength || m.length_mm || m.length_pixels || ''}"
+                                   value="${corr.length || m.length_mm || m.length_pixels || ''}"
                                    placeholder="${m.length_mm ? 'mm' : 'px'}">
                         </div>
                         <div class="info-row">
                             <span class="info-label">Épillets</span>
                             <input type="number" class="editable"
                                    id="spike_${i}_spikelets"
-                                   value="${correctedSpikelets || spike.spikelet_count || ''}"
+                                   value="${corr.spikelets || spike.spikelet_count || ''}"
                                    placeholder="?">
                         </div>
                     </div>
@@ -666,18 +888,28 @@ HTML_TEMPLATE = """
             document.getElementById('validatedCount').textContent = validated;
         }
         
+        function validateWithTag() {
+            // Ajouter le tag "validated" si aucun tag de problème
+            if (currentTags.length === 0) {
+                currentTags = ['validated'];
+                updateTagDisplay();
+            }
+            setStatus('validated');
+        }
+        
         function setStatus(status) {
             const result = filteredResults[currentIndex];
             if (!result) return;
             
             result._corrections = result._corrections || {};
             result._corrections.status = status;
+            result._corrections.tags = currentTags;
             updateStatusBadge(status);
             
             // Auto-save et passer au suivant
             saveCorrections().then(() => {
                 if (status === 'validated' && currentIndex < filteredResults.length - 1) {
-                    navigate(1);
+                    setTimeout(() => navigate(1), 300);
                 }
             });
         }
@@ -691,6 +923,7 @@ HTML_TEMPLATE = """
             // Collecter les corrections
             const corrections = {
                 status: result._corrections?.status || 'pending',
+                tags: currentTags,
                 sample_id: document.getElementById('sampleId').value,
                 notes: document.getElementById('notes').value,
             };
@@ -731,6 +964,23 @@ HTML_TEMPLATE = """
             }
         }
         
+        async function regenerateCSV() {
+            showLoading(true);
+            try {
+                const response = await fetch('/api/regenerate-csv', {method: 'POST'});
+                const data = await response.json();
+                
+                if (data.success) {
+                    showToast(`CSV régénéré: ${data.count} lignes`, 'success');
+                } else {
+                    showToast('Erreur: ' + data.error, 'error');
+                }
+            } catch (e) {
+                showToast('Erreur réseau', 'error');
+            }
+            showLoading(false);
+        }
+        
         function showLoading(show) {
             document.getElementById('loading').classList.toggle('show', show);
         }
@@ -752,6 +1002,15 @@ HTML_TEMPLATE = """
                 return;
             }
             
+            // Raccourcis numériques pour les tags
+            if (e.key >= '1' && e.key <= '8') {
+                const tagIndex = parseInt(e.key) - 1;
+                if (tagIndex < PREDEFINED_TAGS.length) {
+                    toggleTag(PREDEFINED_TAGS[tagIndex].id);
+                }
+                return;
+            }
+            
             switch(e.key) {
                 case 'ArrowLeft':
                     navigate(-1);
@@ -761,7 +1020,7 @@ HTML_TEMPLATE = """
                     break;
                 case 'v':
                 case 'V':
-                    setStatus('validated');
+                    validateWithTag();
                     break;
                 case 'r':
                 case 'R':
@@ -774,6 +1033,10 @@ HTML_TEMPLATE = """
                 case 'f':
                 case 'F':
                     toggleFilter();
+                    break;
+                case 't':
+                case 'T':
+                    document.getElementById('customTag').focus();
                     break;
             }
         });
@@ -788,7 +1051,13 @@ HTML_TEMPLATE = """
 
 @app.route('/')
 def index():
-    return render_template_string(HTML_TEMPLATE)
+    return render_template_string(HTML_TEMPLATE, predefined_tags=json.dumps(PREDEFINED_TAGS))
+
+
+@app.route('/api/tags')
+def api_tags():
+    """Retourne les tags prédéfinis"""
+    return jsonify(PREDEFINED_TAGS)
 
 
 @app.route('/api/results')
@@ -825,10 +1094,7 @@ def api_save():
 
 @app.route('/api/export')
 def api_export():
-    """Exporte toutes les corrections en CSV"""
-    import csv
-    from io import StringIO
-    
+    """Exporte toutes les corrections en CSV téléchargeable"""
     results = load_all_results()
     
     output = StringIO()
@@ -836,32 +1102,117 @@ def api_export():
     
     # Header
     writer.writerow([
-        'image_id', 'status', 'sample_id_original', 'sample_id_corrected',
-        'spike_count', 'notes', 'last_modified'
+        'image_id', 'status', 'tags', 'sample_id_original', 'sample_id_corrected',
+        'spike_count', 'notes', 'verified_at'
     ])
     
     for result in results:
+        verification = result.get('_verification', {})
         corrections = result.get('_corrections', {})
         bag = result.get('bag', {})
         
         writer.writerow([
             Path(result['image']).stem,
-            corrections.get('status', 'pending'),
+            verification.get('status', corrections.get('status', 'pending')),
+            ';'.join(verification.get('tags', corrections.get('tags', []))),
             bag.get('sample_id', ''),
-            corrections.get('sample_id', ''),
+            bag.get('sample_id_corrected', ''),
             len(result.get('spikes', [])),
-            corrections.get('notes', ''),
-            corrections.get('_last_modified', '')
+            verification.get('notes', corrections.get('notes', '')),
+            verification.get('verified_at', '')
         ])
     
     output.seek(0)
     
-    from flask import Response
     return Response(
         output.getvalue(),
         mimetype='text/csv',
         headers={'Content-Disposition': 'attachment; filename=corrections_export.csv'}
     )
+
+
+@app.route('/api/regenerate-csv', methods=['POST'])
+def api_regenerate_csv():
+    """Régénère le fichier results_summarised.csv complet avec les corrections"""
+    try:
+        results = load_all_results()
+        
+        # Chemin du CSV de sortie
+        csv_path = Path(RESULTS_DIR) / 'results_summarised.csv'
+        
+        rows = []
+        for result in results:
+            verification = result.get('_verification', {})
+            bag = result.get('bag', {})
+            cal = result.get('calibration', {})
+            
+            # Utiliser les valeurs corrigées si disponibles
+            sample_id = bag.get('sample_id_corrected') or bag.get('sample_id', '')
+            
+            # Base row pour l'image
+            base_info = {
+                'image_id': Path(result.get('image', '')).stem,
+                'image_path': result.get('image', ''),
+                'verification_status': verification.get('status', 'pending'),
+                'verification_tags': ';'.join(verification.get('tags', [])),
+                'verification_notes': verification.get('notes', ''),
+                'sample_id': sample_id,
+                'sample_bac': bag.get('bac', ''),
+                'sample_ligne': bag.get('ligne', ''),
+                'sample_colonne': bag.get('colonne', ''),
+                'ruler_detected': cal.get('ruler_detected', False),
+                'pixel_per_mm': cal.get('pixel_per_mm', ''),
+                'spike_count': len(result.get('spikes', [])),
+            }
+            
+            # Ajouter une ligne par épi
+            spikes = result.get('spikes', [])
+            if spikes:
+                for i, spike in enumerate(spikes):
+                    m = spike.get('measurements', {})
+                    corr = spike.get('corrections', {})
+                    
+                    row = base_info.copy()
+                    row.update({
+                        'spike_id': spike.get('id', i+1),
+                        'spike_length_mm': corr.get('length') or m.get('length_mm', ''),
+                        'spike_length_px': m.get('length_pixels', ''),
+                        'spike_width_mm': m.get('width_mm', ''),
+                        'spikelet_count': corr.get('spikelets') or spike.get('spikelet_count', ''),
+                        'spikelet_method': spike.get('spikelet_method', ''),
+                        'spikelet_confidence': spike.get('spikelet_confidence', ''),
+                    })
+                    rows.append(row)
+            else:
+                # Image sans épi détecté
+                row = base_info.copy()
+                row.update({
+                    'spike_id': '',
+                    'spike_length_mm': '',
+                    'spike_length_px': '',
+                    'spike_width_mm': '',
+                    'spikelet_count': '',
+                    'spikelet_method': '',
+                    'spikelet_confidence': '',
+                })
+                rows.append(row)
+        
+        # Écrire le CSV
+        if rows:
+            fieldnames = rows[0].keys()
+            with open(csv_path, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
+            
+            logger.info(f"CSV régénéré: {csv_path} ({len(rows)} lignes)")
+            return jsonify({'success': True, 'count': len(rows), 'path': str(csv_path)})
+        else:
+            return jsonify({'success': False, 'error': 'Aucun résultat à exporter'})
+            
+    except Exception as e:
+        logger.error(f"Erreur régénération CSV: {e}")
+        return jsonify({'success': False, 'error': str(e)})
 
 
 def main():
@@ -896,11 +1247,16 @@ def main():
     print(f"Interface: http://{args.host}:{args.port}")
     print(f"Résultats: {results_count} images")
     print(f"\nRaccourcis clavier:")
-    print(f"  ← →  Navigation entre images")
-    print(f"  V    Valider l'image")
-    print(f"  R    Rejeter l'image")
-    print(f"  S    Sauvegarder les corrections")
-    print(f"  F    Filtrer les non-validés")
+    print(f"  ← →    Navigation entre images")
+    print(f"  V      Valider l'image (ajoute tag 'Validé')")
+    print(f"  R      Rejeter l'image")
+    print(f"  S      Sauvegarder les corrections")
+    print(f"  F      Filtrer les non-validés")
+    print(f"  T      Focus sur le champ tag personnalisé")
+    print(f"  1-8    Toggle tag rapide")
+    print(f"\nTags disponibles:")
+    for tag in PREDEFINED_TAGS:
+        print(f"  {tag['shortcut']}  {tag['label']}")
     print(f"{'='*60}\n")
     
     app.run(host=args.host, port=args.port, debug=args.debug)
