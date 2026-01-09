@@ -24,8 +24,8 @@ ENV/
 # Logs
 *.log
 
-# Models (too large for git - download separately)
-models/*.pt
+# Models - tracked with Git LFS
+# models/*.pt  # Now using Git LFS
 models/*.pth
 models/*.onnx
 
