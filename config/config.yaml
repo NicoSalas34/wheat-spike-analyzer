@@ -1,0 +1,93 @@
+# =============================================================================
+# Configuration pour l'analyse d'épis de blé - Version OBB (Oriented Bounding Box)
+# =============================================================================
+# Ce fichier configure le pipeline utilisant le modèle YOLO OBB pour une
+# détection plus précise des objets orientés (épis inclinés, règle, etc.)
+
+# =============================================================================
+# MODÈLE YOLO OBB - Détection principale
+# =============================================================================
+yolo:
+  # Modèle OBB entraîné sur épis de blé (jpg_improved_v2_augmented)
+  model_path: 'models/wheat_spike_yolo.pt'
+  confidence_threshold: 0.35
+  iou_threshold: 0.45
+  ruler_confidence_threshold: 0.15
+  # Classes OBB: 0=ruler, 1=spike, 2=bag, 3=whole_spike
+
+# =============================================================================
+# CALIBRATION - Règle de référence
+# =============================================================================
+ruler_detection:
+  ruler_length_mm: 300     # Longueur connue de la règle (30cm)
+  min_area: 50000          # Aire minimale en pixels²
+  min_aspect_ratio: 5.0    # Ratio longueur/largeur minimum
+
+# =============================================================================
+# COMPTAGE DES ÉPILLETS
+# =============================================================================
+spikelet_counting:
+  enabled: true
+  method: 'yolo'                      # Utiliser YOLO pour compter les épillets
+  yolo:
+    model_path: 'models/spikelets_yolo.pt'
+    confidence_threshold: 0.25
+    iou_threshold: 0.45
+  min_spikelets: 8
+  max_spikelets: 35
+
+# =============================================================================
+# IDENTIFICATION DES SACHETS (OCR)
+# =============================================================================
+bag_digits:
+  enabled: true
+  model_path: 'models/bag_digits_yolo.pt'
+  confidence_threshold: 0.35
+  # Modèle pour détecter l'ouverture du sachet (orientation)
+  opening_model_path: 'models/bag_opening_yolo.pt'
+  opening_confidence_threshold: 0.3
+  # Les 3 chiffres représentent: bac, ligne, colonne (depuis l'ouverture)
+
+# =============================================================================
+# MESURES MORPHOMÉTRIQUES
+# =============================================================================
+measurements:
+  # Méthodes de calcul
+  length_method: 'obb'        # Utiliser la longueur de l'OBB directement
+  width_method: 'obb'         # Utiliser la largeur de l'OBB directement
+  # Métriques à calculer
+  compute_area: true
+  compute_perimeter: true
+  compute_aspect_ratio: true
+
+# =============================================================================
+# VISUALISATION ET DEBUG
+# =============================================================================
+visualization:
+  colors:
+    ruler: [0, 0, 255]       # Rouge (BGR)
+    spike: [0, 255, 0]       # Vert
+    whole_spike: [0, 255, 255]  # Jaune
+    bag: [255, 0, 0]         # Bleu
+    spikelet: [255, 0, 255]  # Magenta
+  line_thickness: 2
+  show_labels: true
+  show_measurements: true
+  font_scale: 0.7
+
+debug:
+  enabled: true
+  save_intermediate_images: true
+  # Images de debug générées:
+  # 01_detections_obb.png    - Toutes les détections OBB
+  # 02_ruler_calibration.png - Calibration avec la règle
+  # 03_spikes_analysis.png   - Épis avec mesures
+  # 04_bag_identification.png - Sachet avec OCR
+  # 05_final_result.png      - Résultat final annoté
+
+# =============================================================================
+# EXPORT DES RÉSULTATS
+# =============================================================================
+export:
+  formats: ['json', 'csv']
+  include_images: true

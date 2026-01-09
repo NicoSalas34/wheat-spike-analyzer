@@ -1,0 +1,67 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Virtual environment
+venv/
+.venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.gemini/
+
+# Logs
+*.log
+
+# Models (too large for git - download separately)
+models/*.pt
+models/*.pth
+models/*.onnx
+
+# Data (too large for git)
+data/raw/*.JPG
+data/raw/*.jpg
+data/raw/*.png
+data/raw/*.PNG
+
+# Training datasets images (keep only structure/labels)
+training_*/images/train/*.JPG
+training_*/images/train/*.jpg
+training_*/images/val/*.JPG
+training_*/images/val/*.jpg
+training_*/labels/*.cache
+
+# Output results
+output/
+
+# YOLO training runs
+runs/
+
+# Archive folder
+_archive/
+
+# PyTorch wheels (AMD ROCm)
+*.whl
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Temporary files
+*.tmp
+*.bak
+*~

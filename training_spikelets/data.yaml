@@ -1,0 +1,17 @@
+# Configuration YOLO pour la détection des épillets
+# Chaque épi de blé contient plusieurs épillets à détecter
+
+path: /home/nicolas-salas/Documents/Documents_these/wheat-spike-analyzer/training_spikelets
+train: images/train
+val: images/val
+
+# Une seule classe: épillet (spikelet)
+nc: 1
+names:
+  0: spikelet
+
+# Notes sur les épillets:
+# - Les épillets sont les unités individuelles le long de l'épi
+# - Ils sont disposés de manière alternée sur le rachis
+# - Typiquement 15-25 épillets par épi selon la variété
+# - Annotez chaque épillet visible avec une bounding box

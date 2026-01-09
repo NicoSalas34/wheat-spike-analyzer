@@ -1,0 +1,38 @@
+# Wheat Spike Analyzer - Requirements
+# =====================================
+# Python 3.12+ required
+
+# Core ML/DL
+ultralytics>=8.3.0
+numpy>=1.26.0,<2.0.0
+opencv-python-headless>=4.10.0
+
+# Image processing
+scikit-image>=0.22.0
+Pillow>=10.0.0
+albumentations>=2.0.0
+
+# Data processing
+pandas>=2.2.0
+PyYAML>=6.0
+
+# Utilities
+tqdm>=4.66.0
+coloredlogs>=15.0
+
+# Optional: OCR (for bag digit detection fallback)
+# easyocr>=1.7.0
+
+# =====================================
+# PyTorch Installation (choose one):
+# =====================================
+# 
+# AMD ROCm 7.1.1 (RX 7000/9000 series):
+#   Use ./install_amd.sh script
+#   Or download wheels from repo.radeon.com
+#
+# NVIDIA CUDA:
+#   pip install torch torchvision torchaudio
+#
+# CPU only:
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu

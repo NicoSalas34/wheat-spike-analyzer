@@ -1,0 +1,11 @@
+# Dataset OBB generated from existing training
+path: /home/nicolas-salas/Documents/Documents_these/wheat-spike-analyzer/training_obb_angled
+train: images/train
+val: images/val
+names:
+  0: ruler
+  1: spike
+  2: bag
+  3: whole_spike
+nc: 4
+# Label format: class x1 y1 x2 y2 x3 y3 x4 y4 (4 corners normalized)
