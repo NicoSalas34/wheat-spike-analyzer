@@ -20,6 +20,9 @@ PyYAML>=6.0
 tqdm>=4.66.0
 coloredlogs>=15.0
 
+# Web interface (verification app)
+Flask>=3.0.0
+
 # Optional: OCR (for bag digit detection fallback)
 # easyocr>=1.7.0
 

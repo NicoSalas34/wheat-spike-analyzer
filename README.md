@@ -29,6 +29,12 @@
 - **CSV** : résumé tabulaire
 - **Images de debug** : visualisation des étapes d'analyse
 
+### ✅ Application de vérification
+- Interface web pour valider/corriger les résultats
+- Système de tags pour marquer les problèmes
+- Filtres avancés (pas de règle, pas d'épis, etc.)
+- Raccourcis clavier pour une vérification rapide
+
 ---
 
 ## 🚀 Installation
@@ -104,6 +110,55 @@ python src/main.py data/raw/image.JPG --output results/
 | `--batch` | Traiter plusieurs images | `False` |
 | `--resume` | Reprendre batch | `False` |
 
+### Application de vérification
+
+Après avoir analysé des images en batch, utilisez l'application de vérification pour valider et corriger les résultats :
+
+```bash
+# Lancer l'application de vérification
+python app/verification_app.py --output output/
+
+# Spécifier le port
+python app/verification_app.py --output output/ --port 8080
+
+# Accessible depuis le réseau
+python app/verification_app.py --output output/ --host 0.0.0.0
+```
+
+L'interface est accessible à **http://127.0.0.1:5000**
+
+#### Raccourcis clavier
+
+| Touche | Action |
+|--------|--------|
+| `←` `→` | Navigation entre images |
+| `V` | Valider l'image |
+| `R` | Rejeter l'image |
+| `S` | Sauvegarder les corrections |
+| `F` | Cycle entre les filtres |
+| `1-8` | Toggle les tags rapides |
+| `T` | Focus sur le champ tag personnalisé |
+
+#### Filtres disponibles
+
+- **Statut** : Tous, Non validés, Validés, Rejetés
+- **Problèmes de détection** : Pas de règle, Pas d'épis, Pas de sachet, Pas d'épillets
+- **Qualité** : Confiance faible, Plusieurs épis, Un seul épi
+- **Tags** : Filtrer par tag assigné
+
+#### Tags prédéfinis
+
+| # | Tag | Description |
+|---|-----|-------------|
+| 1 | ✓ Validé | Image correctement analysée |
+| 2 | Règle non détectée | La règle n'a pas été trouvée |
+| 3 | Épi mal détecté | Problème de détection d'épi |
+| 4 | Sachet illisible | OCR du sachet incorrect |
+| 5 | Épillets incorrects | Comptage d'épillets erroné |
+| 6 | Image floue | Qualité d'image insuffisante |
+| 7 | Plusieurs épis confondus | Épis superposés ou mal séparés |
+| 8 | Calibration incorrecte | Problème de calibration |
+
 ### Utilisation programmatique
 
 ```python
@@ -130,11 +185,13 @@ print(f"Calibration: {results['calibration']['pixel_per_mm']:.2f} px/mm")
 
 ```
 wheat-spike-analyzer/
+├── app/
+│   └── verification_app.py      # Application web de vérification
 ├── config/
 │   └── config.yaml              # Configuration principale
 ├── data/
 │   └── raw/                     # Images à analyser
-├── models/                      # Modèles YOLO (non versionnés)
+├── models/                      # Modèles YOLO (Git LFS)
 │   ├── wheat_spike_yolo.pt      # Détection OBB (ruler, spike, bag, whole_spike)
 │   ├── spikelets_yolo.pt        # Comptage épillets
 │   ├── bag_digits_yolo.pt       # OCR chiffres sachets (1-20)
@@ -159,7 +216,7 @@ wheat-spike-analyzer/
 
 ## 🧠 Modèles
 
-Les modèles YOLO ne sont pas inclus dans le repository (trop volumineux).
+Les modèles YOLO sont stockés via Git LFS (Large File Storage).
 
 | Modèle | Classes | Description |
 |--------|---------|-------------|

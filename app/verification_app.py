@@ -159,25 +159,45 @@ def save_correction(image_id: str, corrections: Dict) -> bool:
 def get_debug_image_path(session_dir: str, image_type: str = 'final') -> Optional[str]:
     """Trouve l'image de debug correspondante"""
     session_path = Path(session_dir)
-    
-    # Chercher différents noms possibles
+    # Chercher différents noms possibles — d'abord dans debug/, puis à la racine
     patterns = {
-        'final': ['05_final*.jpg', '05_final*.png', 'final*.jpg', 'debug_final*.jpg'],
-        'detections': ['01_detections*.jpg', '01_detections*.png'],
-        'spikes': ['02_spikes*.jpg', '03_spikelets*.jpg'],
-        'bag': ['04_bag*.jpg'],
+        'final': ['05_final*.jpg', '05_final*.png', '*final*.jpg', '*final*.png', 'result_annotated*.png'],
+        'detections': ['01_detections*.jpg', '01_detections*.png', '01_detections*.png'],
+        'spikes': ['02_spikes*.jpg', '02_spikes*.png', '03_spikelets*.jpg', '03_spikelets*.png'],
+        'bag': ['04_bag*.jpg', '04_bag*.png'],
     }
-    
+
+    # Helper to search a path for patterns
+    def search_path(p: Path):
+        for pattern in patterns.get(image_type, patterns['final']):
+            matches = list(p.glob(pattern))
+            if matches:
+                return str(matches[0])
+        # Try any image fallback
+        for ext in ('*.png', '*.jpg', '*.jpeg'):
+            matches = list(p.glob(ext))
+            if matches:
+                return str(matches[0])
+        return None
+
+    # 1) check debug subfolder
+    debug_path = session_path / 'debug'
+    if debug_path.exists() and debug_path.is_dir():
+        found = search_path(debug_path)
+        if found:
+            return found
+
+    # 2) check session root
+    found = search_path(session_path)
+    if found:
+        return found
+
+    # 3) recursive search (any matching file under session)
     for pattern in patterns.get(image_type, patterns['final']):
-        matches = list(session_path.glob(pattern))
+        matches = list(session_path.rglob(pattern))
         if matches:
             return str(matches[0])
-    
-    # Fallback: première image jpg trouvée
-    jpgs = list(session_path.glob('*.jpg'))
-    if jpgs:
-        return str(jpgs[0])
-    
+
     return None
 
 
@@ -255,6 +275,44 @@ HTML_TEMPLATE = """
             background: #059669;
         }
         
+        /* Filter dropdown */
+        .filter-dropdown {
+            position: relative;
+            display: inline-block;
+        }
+        
+        .filter-select {
+            background: #0f3460;
+            border: none;
+            color: #eee;
+            padding: 8px 15px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 0.85rem;
+            appearance: none;
+            padding-right: 30px;
+            min-width: 180px;
+        }
+        
+        .filter-select:hover {
+            background: #1a4a80;
+        }
+        
+        .filter-select:focus {
+            outline: none;
+            background: #1a4a80;
+        }
+        
+        .filter-dropdown::after {
+            content: '▼';
+            position: absolute;
+            right: 10px;
+            top: 50%;
+            transform: translateY(-50%);
+            pointer-events: none;
+            font-size: 0.7rem;
+        }
+
         /* Main content */
         .main {
             flex: 1;
@@ -577,9 +635,31 @@ HTML_TEMPLATE = """
     <div class="header">
         <h1>🌾 Wheat Spike Analyzer - Vérification</h1>
         <div class="nav-info">
-            <button class="header-btn" id="filterBtn" onclick="toggleFilter()">
-                Afficher tous
-            </button>
+            <div class="filter-dropdown">
+                <select class="filter-select" id="filterSelect" onchange="applyAdvancedFilter()">
+                    <option value="all">📋 Tous</option>
+                    <option value="pending">⏳ Non validés</option>
+                    <option value="validated">✓ Validés</option>
+                    <option value="rejected">✗ Rejetés</option>
+                    <optgroup label="── Problèmes détection ──">
+                        <option value="no_ruler">📏 Pas de règle</option>
+                        <option value="no_spikes">🌾 Pas d'épis</option>
+                        <option value="no_bag">🏷️ Pas de sachet</option>
+                        <option value="no_spikelets">🔢 Pas d'épillets</option>
+                    </optgroup>
+                    <optgroup label="── Qualité ──">
+                        <option value="low_confidence">⚠️ Confiance faible (&lt;80%)</option>
+                        <option value="multiple_spikes">🌾🌾 Plusieurs épis</option>
+                        <option value="single_spike">🌾 Un seul épi</option>
+                    </optgroup>
+                    <optgroup label="── Tags ──">
+                        <option value="tag_ruler_missing">🏷️ Tag: Règle non détectée</option>
+                        <option value="tag_spike_bad">🏷️ Tag: Épi mal détecté</option>
+                        <option value="tag_bag_unreadable">🏷️ Tag: Sachet illisible</option>
+                        <option value="tag_spikelets_wrong">🏷️ Tag: Épillets incorrects</option>
+                    </optgroup>
+                </select>
+            </div>
             <button class="header-btn export" onclick="regenerateCSV()">
                 📊 Régénérer CSV
             </button>
@@ -677,7 +757,7 @@ HTML_TEMPLATE = """
         <kbd>V</kbd> Valider
         <kbd>R</kbd> Rejeter
         <kbd>S</kbd> Sauver
-        <kbd>F</kbd> Filtre
+        <kbd>F</kbd> Cycle filtres
         <kbd>1-8</kbd> Tags
     </div>
     
@@ -691,7 +771,6 @@ HTML_TEMPLATE = """
         let results = [];
         let filteredResults = [];
         let currentIndex = 0;
-        let filterPending = false;
         let currentTags = [];
         
         // Charger les résultats au démarrage
@@ -772,24 +851,101 @@ HTML_TEMPLATE = """
         }
         
         function applyFilter() {
-            if (filterPending) {
-                filteredResults = results.filter(r => 
-                    !r._corrections || r._corrections.status !== 'validated'
-                );
-            } else {
-                filteredResults = [...results];
-            }
+            // Appelé au chargement initial - applique le filtre courant
+            applyAdvancedFilter();
+        }
+        
+        function applyAdvancedFilter() {
+            const filterValue = document.getElementById('filterSelect').value;
+            
+            filteredResults = results.filter(r => {
+                const corrections = r._corrections || {};
+                const status = corrections.status || 'pending';
+                const tags = corrections.tags || [];
+                const cal = r.calibration || {};
+                const bag = r.bag || {};
+                const spikes = r.spikes || [];
+                
+                switch(filterValue) {
+                    case 'all':
+                        return true;
+                    case 'pending':
+                        return status !== 'validated';
+                    case 'validated':
+                        return status === 'validated';
+                    case 'rejected':
+                        return status === 'rejected';
+                    
+                    // Problèmes de détection
+                    case 'no_ruler':
+                        return !cal.ruler_detected;
+                    case 'no_spikes':
+                        return spikes.length === 0;
+                    case 'no_bag':
+                        return !bag.detected;
+                    case 'no_spikelets':
+                        return spikes.some(s => !s.spikelet_count || s.spikelet_count === 0);
+                    
+                    // Qualité
+                    case 'low_confidence':
+                        return (bag.confidence && bag.confidence < 0.8) || 
+                               spikes.some(s => s.confidence && s.confidence < 0.8);
+                    case 'multiple_spikes':
+                        return spikes.length > 1;
+                    case 'single_spike':
+                        return spikes.length === 1;
+                    
+                    // Tags
+                    case 'tag_ruler_missing':
+                        return tags.includes('ruler_missing');
+                    case 'tag_spike_bad':
+                        return tags.includes('spike_bad');
+                    case 'tag_bag_unreadable':
+                        return tags.includes('bag_unreadable');
+                    case 'tag_spikelets_wrong':
+                        return tags.includes('spikelets_wrong');
+                    
+                    default:
+                        return true;
+                }
+            });
+            
             currentIndex = Math.min(currentIndex, Math.max(0, filteredResults.length - 1));
+            if (filteredResults.length > 0) {
+                displayResult(currentIndex);
+            } else {
+                // Aucun résultat pour ce filtre
+                document.getElementById('mainImage').src = '';
+                document.getElementById('imageName').textContent = 'Aucune image';
+            }
+            updateCounter();
         }
         
         function toggleFilter() {
-            filterPending = !filterPending;
-            document.getElementById('filterBtn').textContent = 
-                filterPending ? 'Non validés' : 'Afficher tous';
-            document.getElementById('filterBtn').classList.toggle('active', filterPending);
-            applyFilter();
-            displayResult(currentIndex);
-            updateCounter();
+            // Legacy - bascule entre tous et non validés
+            const select = document.getElementById('filterSelect');
+            select.value = select.value === 'all' ? 'pending' : 'all';
+            applyAdvancedFilter();
+        }
+        
+        function cycleFilter() {
+            // Cycle à travers les filtres principaux avec la touche F
+            const select = document.getElementById('filterSelect');
+            const mainFilters = ['all', 'pending', 'no_ruler', 'no_spikes', 'no_bag'];
+            const currentIdx = mainFilters.indexOf(select.value);
+            const nextIdx = (currentIdx + 1) % mainFilters.length;
+            select.value = mainFilters[nextIdx];
+            applyAdvancedFilter();
+            
+            // Afficher quel filtre est actif
+            const filterNames = {
+                'all': 'Tous',
+                'pending': 'Non validés',
+                'no_ruler': 'Sans règle',
+                'no_spikes': 'Sans épis',
+                'no_bag': 'Sans sachet'
+            };
+            showToast('Filtre: ' + filterNames[mainFilters[nextIdx]], 'info');
         }
         
         function navigate(delta) {
@@ -1032,7 +1188,7 @@ HTML_TEMPLATE = """
                     break;
                 case 'f':
                 case 'F':
-                    toggleFilter();
+                    cycleFilter();
                     break;
                 case 't':
                 case 'T':
@@ -1067,33 +1223,35 @@ def api_results():
     return jsonify(results)
 
 
-@app.route('/api/image/<path:session_dir>')
-def api_image(session_dir):
-    """Retourne l'image de debug pour une session"""
-    image_path = get_debug_image_path(session_dir, 'final')
-    
-    if image_path and os.path.exists(image_path):
-        return send_file(image_path, mimetype='image/jpeg')
-    
-    # Image placeholder si non trouvée
-    return '', 404
-
-
 @app.route('/api/image')
-def api_image_query():
+def api_image():
     """Retourne l'image de debug pour une session (paramètre query `session_dir`).
 
     Utiliser une query string évite les problèmes d'encoding des slashes dans l'URL.
     """
     session_dir = request.args.get('session_dir')
+    logger.info(f"API image request: session_dir={session_dir}")
     if not session_dir:
+        logger.warning("No session_dir provided")
         return '', 404
 
     # session_dir est normalement décodé par Flask; garantir string
     image_path = get_debug_image_path(session_dir, 'final')
-    if image_path and os.path.exists(image_path):
-        return send_file(image_path, mimetype='image/jpeg')
+    logger.info(f"get_debug_image_path returned: {image_path}")
+    if image_path:
+        # Convertir en chemin absolu depuis la racine du projet
+        abs_path = Path(image_path).resolve()
+        logger.info(f"Absolute path: {abs_path}")
+        if abs_path.exists():
+            logger.info(f"Serving image: {abs_path}")
+            # Déterminer le mime type en fonction de l'extension
+            if str(abs_path).lower().endswith('.png'):
+                mimetype = 'image/png'
+            else:
+                mimetype = 'image/jpeg'
+            return send_file(str(abs_path), mimetype=mimetype)
 
+    logger.warning(f"Image not found for session_dir={session_dir}, image_path={image_path}")
     return '', 404
 
 
@@ -1248,7 +1406,8 @@ def main():
     
     args = parser.parse_args()
     
-    RESULTS_DIR = args.output
+    # Convertir en chemin absolu pour éviter les problèmes de répertoire de travail
+    RESULTS_DIR = str(Path(args.output).resolve())
     
     if not Path(RESULTS_DIR).exists():
         logger.error(f"Dossier de résultats non trouvé: {RESULTS_DIR}")
