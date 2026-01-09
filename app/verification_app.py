@@ -807,8 +807,8 @@ HTML_TEMPLATE = """
             const result = filteredResults[index];
             const corrections = result._corrections || {};
             
-            // Image
-            document.getElementById('mainImage').src = `/api/image/${encodeURIComponent(result._session_dir)}`;
+            // Image (request image via query param to avoid path encoding issues)
+            document.getElementById('mainImage').src = '/api/image?session_dir=' + encodeURIComponent(result._session_dir);
             document.getElementById('imageName').textContent = result.image.split('/').pop();
             
             // Status
@@ -1076,6 +1076,24 @@ def api_image(session_dir):
         return send_file(image_path, mimetype='image/jpeg')
     
     # Image placeholder si non trouvée
+    return '', 404
+
+
+@app.route('/api/image')
+def api_image_query():
+    """Retourne l'image de debug pour une session (paramètre query `session_dir`).
+
+    Utiliser une query string évite les problèmes d'encoding des slashes dans l'URL.
+    """
+    session_dir = request.args.get('session_dir')
+    if not session_dir:
+        return '', 404
+
+    # session_dir est normalement décodé par Flask; garantir string
+    image_path = get_debug_image_path(session_dir, 'final')
+    if image_path and os.path.exists(image_path):
+        return send_file(image_path, mimetype='image/jpeg')
+
     return '', 404
 
 
