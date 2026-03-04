@@ -14,6 +14,72 @@ yolo:
   iou_threshold: 0.45
   ruler_confidence_threshold: 0.15
   # Classes OBB: 0=ruler, 1=spike, 2=bag, 3=whole_spike
+  # TTA: support natif Ultralytics (augment=True). Note: pas supporté par tous
+  # les modèles OBB. Désactivé par défaut.
+  tta:
+    enabled: false
+  # Inférence par tuiles (sliced inference) pour améliorer la détection
+  # des épis longs sur les images haute résolution (5568×4872).
+  # Découpe l'image en tuiles avec chevauchement + inférence full-image,
+  # puis fusionne les résultats par NMS OBB.
+  sliced_inference:
+    enabled: true              # Activer l'inférence par tuiles
+    slice_size: 1280           # Taille de chaque tuile en pixels
+    overlap_ratio: 0.25        # Chevauchement entre tuiles (25%)
+    # Résolution d'inférence (imgsz) pour le pass full-image.
+    # Plus c'est grand, meilleure est la détection des épis longs,
+    # mais plus c'est lent et gourmand en VRAM.
+    # 1024 = défaut YOLO (rapide), 2048 = recommandé pour 5568×4872px.
+    full_image_imgsz: 1024
+    # Vérification croisée full-image ↔ tuiles pour réduire les faux positifs :
+    tile_only_min_confidence: 0.5   # Confiance min pour accepter une détection tile-only
+    require_multi_tile_consensus: true  # Exiger qu'un objet soit vu par ≥2 tuiles si non confirmé par full-image
+    # Extension des détections full-image avec les tuiles :
+    # Si une tuile capture un bout d'épi manquant, la bbox full-image est étendue.
+    extend_full_with_tiles: true       # Activer l'extension
+    extension_min_overlap: 0.03      # IoU min pour considérer qu'une tuile matche une full-det
+    extension_max_increase: 0.7        # Augmentation max tolérée de l'aire (+50%)
+  # Raffinement des spikes via consensus détection/segmentation.
+  # Si un bord de la bbox du spike est proche d'un bord du whole_spike,
+  # on lance la segmentation sur la zone whole_spike et on compare
+  # la bbox seg avec la bbox det (consensus).
+  spike_refinement:
+    enabled: true                # Activer le raffinement
+    border_threshold_px: 40      # Distance (px) pour considérer un bord comme « proche »
+    margin: 60                   # Marge (px) autour du whole_spike pour le crop
+  # Filtres géométriques post-détection (appliqués en mode standard ET sliced).
+  # Élimine les faux positifs par des vérifications de taille, proportion, etc.
+  detection_verification:
+    enabled: true
+    ruler:
+      min_aspect_ratio: 5.0       # La règle est très allongée
+      min_area_ratio: 0.005       # Au moins 0.5% de l'image
+      max_count: 1                # Au maximum 2 règles (normalement 1)
+    spike:
+      min_aspect_ratio: 1.5       # L'épi est allongé (pas carré)
+      max_aspect_ratio: 25.0      # Pas trop extrême
+      min_area_ratio: 0.0005      # Au moins 0.05% de l'image
+      max_area_ratio: 0.15        # Pas plus de 15% de l'image
+      min_height_px: 400           # Au moins 80px de hauteur
+    whole_spike:
+      # Filtres très permissifs — les whole_spikes sont fiables
+      min_area_ratio: 0.0002    # Rejet uniquement des artefacts minuscules
+      max_area_ratio: 0.50      # Très permissif (50% de l'image)
+      min_height_px: 50         # Seulement supprimer le bruit
+    # Si un spike est contenu à >60% dans un whole_spike, il est supprimé
+    spike_inside_whole_spike_threshold: 1.5
+    # Si un spike est contenu à >60% dans un autre spike
+    spike_inside_spike_threshold: 0.8
+    # Si un whole_spike est contenu à >60% dans un autre whole_spike
+    whole_spike_inside_whole_spike_threshold: 0.6
+    # Si le ratio d'aire (grand/petit) dépasse ce seuil lors d'un containment
+    # intra-classe, la grande détection est considérée comme faux positif
+    # englobant et est supprimée à la place de la petite.
+    nested_max_area_ratio: 5.0
+    bag:
+      min_area_ratio: 0.002       # Au moins 0.2% de l'image
+      max_area_ratio: 0.25        # Pas plus de 25% de l'image
+      max_count: 1                # Au maximum 3 sachets
 
 # =============================================================================
 # CALIBRATION - Règle de référence
@@ -24,6 +90,16 @@ ruler_detection:
   min_aspect_ratio: 5.0    # Ratio longueur/largeur minimum
 
 # =============================================================================
+# CALIBRATION - Détection des graduations (méthode principale)
+# =============================================================================
+graduation_detection:
+  enabled: true
+  model_path: 'models/graduations_yolo.pt'  # Modèle OBB graduations
+  confidence_threshold: 0.3
+  # Classes: 0='0', 1='10', 2='20', 3='30' (graduations à 0, 10, 20, 30 cm)
+  # La calibration mesure la distance en pixels entre deux graduations connues
+
+# =============================================================================
 # COMPTAGE DES ÉPILLETS
 # =============================================================================
 spikelet_counting:
@@ -31,10 +107,49 @@ spikelet_counting:
   method: 'yolo'                      # Utiliser YOLO pour compter les épillets
   yolo:
     model_path: 'models/spikelets_yolo.pt'
-    confidence_threshold: 0.25
+    confidence_threshold: 0.2
     iou_threshold: 0.45
   min_spikelets: 8
   max_spikelets: 35
+  # Test-Time Augmentation pour le comptage d'épillets
+  tta:
+    enabled: true              # Activer le TTA (plus lent mais plus robuste)
+    augmentations:              # Transformations appliquées
+      - original
+      - flip_h
+      - flip_v
+      - rot180
+  segmentation:                 # Segmentation individuelle des épillets via SAM2
+    enabled: true               # Activer pour obtenir taille/forme/aire par épillet
+
+# =============================================================================
+# SEGMENTATION DES ÉPIS (YOLO-Seg)
+# =============================================================================
+# Modèle YOLO-Seg entraîné pour la segmentation pixel-level des épis.
+# Remplace SAM2 : plus rapide, plus léger, spécialisé.
+segmentation:
+  enabled: true
+  spike_seg_model: 'models/spike_seg_yolo.pt'  # Modèle YOLO-Seg épis
+  confidence_threshold: 0.4                     # Seuil de confiance
+  min_mask_area: 1000                           # Aire minimale du masque épi (pixels²)
+  # TTA: consensus par vote majoritaire sur les masques (flip_h, flip_v, rot180)
+  tta:
+    enabled: true
+    augmentations:
+      - original
+      - flip_h
+      - flip_v
+      - rot180
+      - brightness_up
+      - contrast_up
+
+# =============================================================================
+# APPARIEMENT SPIKE ↔ WHOLE_SPIKE
+# =============================================================================
+# Algorithme hongrois avec IoU OBB pour un appariement optimal.
+spike_matching:
+  min_iou: 0.01                 # IoU minimum pour valider un appariement (bas car whole_spike >> spike)
+  min_containment: 0.3          # Score de containment minimum (spike dans whole_spike)
 
 # =============================================================================
 # IDENTIFICATION DES SACHETS (OCR)
@@ -47,6 +162,37 @@ bag_digits:
   opening_model_path: 'models/bag_opening_yolo.pt'
   opening_confidence_threshold: 0.3
   # Les 3 chiffres représentent: bac, ligne, colonne (depuis l'ouverture)
+  # TTA: vote majoritaire sur les chiffres détectés
+  tta:
+    enabled: true
+    augmentations:
+      - original
+      - flip_h
+      - flip_v
+      - rot180
+      - brightness_up
+      - contrast_up
+
+# =============================================================================
+# DÉTECTION DU RACHIS (YOLO-Seg)
+# =============================================================================
+# Modèle yolo26n-seg entraîné pour segmenter le rachis sur les crops d'épis.
+rachis_detection:
+  enabled: true
+  model_path: 'models/rachis_yolo.pt'
+  confidence_threshold: 0.2
+  crop_margin: 30               # Marge autour de l'OBB pour le crop (pixels)
+  # TTA: consensus par vote majoritaire sur les masques du rachis
+  tta:
+    enabled: true
+    augmentations:
+      - original
+      - flip_h
+      - flip_v
+      - rot180
+      - brightness_up
+      - contrast_up
+    consensus_threshold: 0.4    # Seuil bas car le rachis est fin
 
 # =============================================================================
 # MESURES MORPHOMÉTRIQUES
@@ -81,9 +227,14 @@ debug:
   # Images de debug générées:
   # 01_detections_obb.png    - Toutes les détections OBB
   # 02_ruler_calibration.png - Calibration avec la règle
+  # 02b_graduations.png      - Graduations détectées sur la règle
   # 03_spikes_analysis.png   - Épis avec mesures
   # 04_bag_identification.png - Sachet avec OCR
   # 05_final_result.png      - Résultat final annoté
+  # 05b_segmentation.png     - Segmentation YOLO-Seg des épis
+  # 06_spikelets.png         - Segmentation individuelle des épillets
+  # 07_rachis.png            - Détection du rachis (YOLO-Seg)
+  # 08_insertion_angles.png  - Angles d'insertion des épillets
 
 # =============================================================================
 # EXPORT DES RÉSULTATS

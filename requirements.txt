@@ -4,13 +4,16 @@
 
 # Core ML/DL
 ultralytics>=8.3.0
-numpy>=1.26.0,<2.0.0
+numpy>=1.26.0
 opencv-python-headless>=4.10.0
 
 # Image processing
 scikit-image>=0.22.0
 Pillow>=10.0.0
 albumentations>=2.0.0
+
+# Scientific computing
+scipy>=1.12.0
 
 # Data processing
 pandas>=2.2.0
@@ -19,6 +22,7 @@ PyYAML>=6.0
 # Utilities
 tqdm>=4.66.0
 coloredlogs>=15.0
+psutil>=5.9.0
 
 # Web interface (verification app)
 Flask>=3.0.0
@@ -30,9 +34,9 @@ Flask>=3.0.0
 # PyTorch Installation (choose one):
 # =====================================
 # 
-# AMD ROCm 7.1.1 (RX 7000/9000 series):
+# AMD ROCm (RX 7000/9000 series):
 #   Use ./install_amd.sh script
-#   Or download wheels from repo.radeon.com
+#   Or: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm6.3
 #
 # NVIDIA CUDA:
 #   pip install torch torchvision torchaudio

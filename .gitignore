@@ -1,4 +1,8 @@
-# Python
+# ==============================================================================
+# Wheat Spike Analyzer - .gitignore
+# ==============================================================================
+
+# ── Python ────────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *$py.class
@@ -9,59 +13,82 @@ __pycache__/
 dist/
 build/
 
-# Virtual environment
+# ── Virtual environment ──────────────────────────────────────────────────────
 venv/
 .venv/
 ENV/
 
-# IDE
+# ── IDE / Editor ─────────────────────────────────────────────────────────────
 .idea/
 .vscode/
 *.swp
 *.swo
 .gemini/
 
-# Logs
+# ── Logs ─────────────────────────────────────────────────────────────────────
 *.log
 
-# Models - tracked with Git LFS
-# models/*.pt  # Now using Git LFS
+# ── Data / Images ────────────────────────────────────────────────────────────
+# All raw images (too large for git)
+data/raw/
+data/validation/
+
+# Keep test sample (3 images for CI / quick tests)
+!data/test_sample/
+!data/test_sample/*.jpg
+!data/test_sample/*.JPG
+
+# Loose images in data/ root (old copies)
+data/*.JPG
+data/*.jpg
+data/*.png
+data/*.PNG
+
+# ── Training datasets ────────────────────────────────────────────────────────
+# Exclure entièrement les dossiers d'entraînement (images + labels)
+# Les datasets sont trop volumineux pour git.
+# Reconstruire avec les scripts dans scripts/ si nécessaire.
+training_bag_digits/
+training_bag_opening/
+training_graduations/
+training_obb_angled/
+training_rachis/
+training_spikelets/
+training_spikelets_segmentation/
+training_spike_segmentation/
+
+# ── Output results ───────────────────────────────────────────────────────────
+output/
+
+# ── YOLO training runs ──────────────────────────────────────────────────────
+runs/
+
+# ── Pre-trained base models (downloaded from Ultralytics) ────────────────────
+# These are base YOLO checkpoints, not our trained models.
+# Users download them via ultralytics automatically.
+yolo*.pt
+yoloe*.pt
+# Our trained models in models/ are tracked via Git LFS (see .gitattributes)
+# Exclude non-.pt model formats
 models/*.pth
 models/*.onnx
 
-# Data (too large for git)
-data/raw/*.JPG
-data/raw/*.jpg
-data/raw/*.png
-data/raw/*.PNG
+# ── X-AnyLabeling ───────────────────────────────────────────────────────────
+X-AnyLabeling-Server/
 
-# Training datasets images (keep only structure/labels)
-training_*/images/train/*.JPG
-training_*/images/train/*.jpg
-training_*/images/val/*.JPG
-training_*/images/val/*.jpg
-training_*/labels/*.cache
-
-# Output results
-output/
-
-# YOLO training runs
-runs/
-
-# Archive folder
+# ── Archive / temp ───────────────────────────────────────────────────────────
 _archive/
-
-# PyTorch wheels (AMD ROCm)
 *.whl
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Jupyter
-.ipynb_checkpoints/
-
-# Temporary files
 *.tmp
 *.bak
 *~
+
+# ── OS ───────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Jupyter ──────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+
+# ── AI instructions (internal) ───────────────────────────────────────────────
+.ai-instructions.md

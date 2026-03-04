@@ -1,7 +1,0 @@
-# Dataset bag_opening pour détection de l'ouverture du sachet
-path: /home/nicolas-salas/Documents/Documents_these/wheat-spike-analyzer/training_bag_opening
-train: images/train
-val: images/val
-names:
-  0: bag_opening
-nc: 1

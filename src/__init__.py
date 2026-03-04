@@ -6,6 +6,11 @@ Analyse phénotypique d'épis de blé
 __version__ = "1.0.0"
 __author__ = "Votre nom"
 
-from .analyzer import WheatSpikeAnalyzer
+try:
+    from .analyzer import WheatSpikeAnalyzer
+except ImportError:
+    WheatSpikeAnalyzer = None
 
-__all__ = ['WheatSpikeAnalyzer']
+from .analyzer_obb import WheatSpikeAnalyzerOBB
+
+__all__ = ['WheatSpikeAnalyzer', 'WheatSpikeAnalyzerOBB']

@@ -455,6 +455,99 @@ class BagDigitDetector:
             logger.error(f"Erreur détection bag_digits: {e}")
             return []
     
+    def detect_tta(
+        self,
+        bag_roi: np.ndarray,
+        augmentations: Optional[List[str]] = None,
+    ) -> List[Dict]:
+        """
+        Détecte les chiffres avec TTA (Test-Time Augmentation).
+        
+        Exécute la détection sur plusieurs versions augmentées de l'image,
+        regroupe les détections par position et vote sur les valeurs.
+        
+        Args:
+            bag_roi: Image du sachet (BGR)
+            augmentations: Liste d'augmentations (défaut: geometric + photometric)
+            
+        Returns:
+            Liste de détections avec vote majoritaire sur les valeurs
+        """
+        if not self.is_available():
+            return []
+        
+        try:
+            from .tta import tta_detect_digits
+        except ImportError:
+            from tta import tta_detect_digits
+        
+        return tta_detect_digits(
+            model=self.model,
+            bag_roi=bag_roi,
+            conf=self.confidence_threshold,
+            class_to_value=self.CLASS_TO_VALUE,
+            augmentations=augmentations,
+            nms_iou=0.5,
+            device=self.device,
+        )
+    
+    def detect_sample_id_tta(
+        self,
+        bag_roi: np.ndarray,
+        augmentations: Optional[List[str]] = None,
+    ) -> Dict:
+        """
+        Version TTA de detect_sample_id.
+        Utilise TTA pour la détection des chiffres, puis la même logique
+        d'orientation et d'assignation bac/ligne/colonne.
+        """
+        # Détecter l'orientation du sachet (pas de TTA ici, c'est robuste)
+        orientation = self._detect_bag_orientation(bag_roi)
+        
+        # Détecter les chiffres avec TTA
+        detections = self.detect_tta(bag_roi, augmentations=augmentations)
+        
+        # Trier les détections en fonction de la position de l'ouverture
+        h, w = bag_roi.shape[:2]
+        sorted_detections = self._sort_detections_by_opening(detections, orientation, (h, w))
+        
+        result = {
+            'bac': None,
+            'ligne': None,
+            'colonne': None,
+            'sample_id': None,
+            'detections': sorted_detections,
+            'confidence': 0.0,
+            'complete': False,
+            'orientation': orientation,
+        }
+        
+        if not sorted_detections:
+            return result
+        
+        if len(sorted_detections) >= 1:
+            result['bac'] = sorted_detections[0]['value']
+        if len(sorted_detections) >= 2:
+            result['ligne'] = sorted_detections[1]['value']
+        if len(sorted_detections) >= 3:
+            result['colonne'] = sorted_detections[2]['value']
+        
+        if detections:
+            result['confidence'] = sum(d['confidence'] for d in detections) / len(detections)
+        
+        result['complete'] = all([result['bac'], result['ligne'], result['colonne']])
+        
+        if result['complete']:
+            result['sample_id'] = f"{result['bac']}-{result['ligne']}-{result['colonne']}"
+        elif result['bac'] or result['ligne'] or result['colonne']:
+            parts = []
+            parts.append(str(result['bac']) if result['bac'] else '?')
+            parts.append(str(result['ligne']) if result['ligne'] else '?')
+            parts.append(str(result['colonne']) if result['colonne'] else '?')
+            result['sample_id'] = '-'.join(parts)
+        
+        return result
+
     def detect_sample_id(
         self,
         bag_roi: np.ndarray,

@@ -80,6 +80,11 @@ Images de debug générées:
         help='Désactiver les images de debug'
     )
     parser.add_argument(
+        '--low-debug',
+        action='store_true',
+        help='Mode debug léger: génère uniquement result_annotated.png'
+    )
+    parser.add_argument(
         '--resume',
         action='store_true',
         help='Reprendre le batch en sautant les images déjà traitées'
@@ -109,7 +114,14 @@ Images de debug générées:
     
     # Créer l'analyseur
     try:
-        debug = not args.no_debug
+        # Déterminer le niveau de debug
+        if args.no_debug:
+            debug = False
+        elif args.low_debug:
+            debug = 'low'
+        else:
+            debug = True
+        
         analyzer = create_analyzer_from_config(
             config_path=str(config_path),
             output_dir=args.output,
