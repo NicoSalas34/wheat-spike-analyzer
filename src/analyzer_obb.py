@@ -611,9 +611,9 @@ class WheatSpikeAnalyzerOBB:
 
         Stratégie en deux temps :
         1. **Vérification de bordure** : on vérifie qu'au moins un bord de la
-           bbox du spike est proche (< border_threshold_px) d'un bord de la bbox
-           du whole_spike.  Si ce n'est pas le cas le spike semble correctement
-           contenu et aucun raffinement n'est nécessaire.
+           bbox du spike est loin (> border_threshold_px) d'un bord de la bbox
+           du whole_spike.  Si tous les bords sont proches, le spike semble
+           correctement détecté et aucun raffinement n'est nécessaire.
         2. **Consensus detection ↔ segmentation** : on fait un crop redressé
            couvrant la zone whole_spike, on y lance le modèle de segmentation,
            on dérive un OBB « seg » du masque, puis on le compare à l'OBB
@@ -642,12 +642,12 @@ class WheatSpikeAnalyzerOBB:
         # =================================================================
         # 1) Vérification de bordure
         # =================================================================
-        if not self._spike_border_near_whole_spike(sp_det, ws_det,
+        if self._spike_border_near_whole_spike(sp_det, ws_det,
                                                     threshold_px=border_threshold_px):
-            logger.debug("    Spike OK: aucun bord proche du whole_spike → pas de raffinement")
+            logger.debug("    Spike OK: bords proches du whole_spike → pas de raffinement")
             return None
 
-        logger.info(f"    Bord du spike proche du whole_spike → lancement du raffinement")
+        logger.info(f"    Bord du spike loin du whole_spike → lancement du raffinement")
         logger.info(f"    (spike={sp_det.height:.0f}px vs whole_spike={ws_det.height:.0f}px)")
 
         h_img, w_img = image.shape[:2]

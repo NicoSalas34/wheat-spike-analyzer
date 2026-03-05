@@ -90,5 +90,8 @@ Thumbs.db
 # ── Jupyter ──────────────────────────────────────────────────────────────────
 .ipynb_checkpoints/
 
+# ── Temporary / training data ────────────────────────────────────────────────
+tmp/
+
 # ── AI instructions (internal) ───────────────────────────────────────────────
 .ai-instructions.md
