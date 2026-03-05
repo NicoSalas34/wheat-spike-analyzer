@@ -44,7 +44,7 @@ yolo:
   # on lance la segmentation sur la zone whole_spike et on compare
   # la bbox seg avec la bbox det (consensus).
   spike_refinement:
-    enabled: true                # Activer le raffinement
+    enabled: false                # Activer le raffinement
     border_threshold_px: 40      # Distance (px) pour considérer un bord comme « proche »
     margin: 60                   # Marge (px) autour du whole_spike pour le crop
   # Filtres géométriques post-détection (appliqués en mode standard ET sliced).
@@ -58,7 +58,7 @@ yolo:
     spike:
       min_aspect_ratio: 1.5       # L'épi est allongé (pas carré)
       max_aspect_ratio: 25.0      # Pas trop extrême
-      min_area_ratio: 0.0005      # Au moins 0.05% de l'image
+      min_area_ratio: 0.01      # Au moins 0.05% de l'image
       max_area_ratio: 0.15        # Pas plus de 15% de l'image
       min_height_px: 400           # Au moins 80px de hauteur
     whole_spike:
