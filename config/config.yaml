@@ -10,7 +10,7 @@
 yolo:
   # Modèle OBB entraîné sur épis de blé (jpg_improved_v2_augmented)
   model_path: 'models/wheat_spike_yolo.pt'
-  confidence_threshold: 0.35
+  confidence_threshold: 0.2 
   iou_threshold: 0.45
   ruler_confidence_threshold: 0.15
   # Classes OBB: 0=ruler, 1=spike, 2=bag, 3=whole_spike
@@ -23,7 +23,7 @@ yolo:
   # Découpe l'image en tuiles avec chevauchement + inférence full-image,
   # puis fusionne les résultats par NMS OBB.
   sliced_inference:
-    enabled: true              # Activer l'inférence par tuiles
+    enabled: false              # Activer l'inférence par tuiles
     slice_size: 1280           # Taille de chaque tuile en pixels
     overlap_ratio: 0.25        # Chevauchement entre tuiles (25%)
     # Résolution d'inférence (imgsz) pour le pass full-image.
@@ -44,7 +44,7 @@ yolo:
   # on lance la segmentation sur la zone whole_spike et on compare
   # la bbox seg avec la bbox det (consensus).
   spike_refinement:
-    enabled: true                # Activer le raffinement
+    enabled: false                # Activer le raffinement
     border_threshold_px: 40      # Distance (px) pour considérer un bord comme « proche »
     margin: 60                   # Marge (px) autour du whole_spike pour le crop
   # Filtres géométriques post-détection (appliqués en mode standard ET sliced).
@@ -58,9 +58,9 @@ yolo:
     spike:
       min_aspect_ratio: 1.5       # L'épi est allongé (pas carré)
       max_aspect_ratio: 25.0      # Pas trop extrême
-      min_area_ratio: 0.0005      # Au moins 0.05% de l'image
-      max_area_ratio: 0.15        # Pas plus de 15% de l'image
-      min_height_px: 400           # Au moins 80px de hauteur
+      min_area_ratio: 0    # Au moins 0.05% de l'image
+      max_area_ratio: 1        # Pas plus de 15% de l'image
+      min_height_px: 80           # Au moins 80px de hauteur
     whole_spike:
       # Filtres très permissifs — les whole_spikes sont fiables
       min_area_ratio: 0.0002    # Rejet uniquement des artefacts minuscules
@@ -174,15 +174,16 @@ bag_digits:
       - contrast_up
 
 # =============================================================================
-# DÉTECTION DU RACHIS (YOLO-Seg)
+# DÉTECTION DU RACHIS (YOLO-Pose)
 # =============================================================================
-# Modèle yolo26n-seg entraîné pour segmenter le rachis sur les crops d'épis.
+# Modèle YOLO-Pose entraîné sur le rachis (5 keypoints).
 rachis_detection:
   enabled: true
-  model_path: 'models/rachis_yolo.pt'
+  task: 'pose'
+  model_path: 'runs/pose/runs/rachis_yolo11n_pose/weights/best.pt'
   confidence_threshold: 0.2
   crop_margin: 30               # Marge autour de l'OBB pour le crop (pixels)
-  # TTA: consensus par vote majoritaire sur les masques du rachis
+  # TTA (segment): ignoré automatiquement en mode pose
   tta:
     enabled: true
     augmentations:
@@ -192,7 +193,7 @@ rachis_detection:
       - rot180
       - brightness_up
       - contrast_up
-    consensus_threshold: 0.4    # Seuil bas car le rachis est fin
+    consensus_threshold: 0.4
 
 # =============================================================================
 # MESURES MORPHOMÉTRIQUES

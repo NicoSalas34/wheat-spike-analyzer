@@ -124,6 +124,7 @@ class WheatSpikeAnalyzerOBB:
         self.detector = self._load_yolo_model()
         
         # Charger les modèles auxiliaires
+        self.rachis_model_task = 'segment'
         self.spikelet_counter = self._load_spikelet_counter()
         self.bag_digit_detector = self._load_bag_digit_detector()
         self.graduation_detector = self._load_graduation_detector()
@@ -157,6 +158,9 @@ class WheatSpikeAnalyzerOBB:
             'augmentations', ['original', 'flip_h', 'flip_v', 'rot180', 'brightness_up', 'contrast_up']
         )
         self.tta_rachis_consensus = rachis_tta.get('consensus_threshold', 0.4)
+        if self.rachis_model_task == 'pose' and self.use_tta_rachis:
+            logger.warning("TTA rachis désactivé: non pris en charge pour YOLO-Pose")
+            self.use_tta_rachis = False
         
         # Étape 9: Bag digit OCR
         bag_tta = self.config.get('bag_digits', {}).get('tta', {})
@@ -826,7 +830,7 @@ class WheatSpikeAnalyzerOBB:
         return (refined_det, seg_result)
     
     def _load_rachis_detector(self):
-        """Charge le détecteur/segmenteur de rachis (YOLO-Seg)"""
+        """Charge le modèle rachis (YOLO-Pose ou YOLO-Seg)."""
         from ultralytics import YOLO
         
         rachis_config = self.config.get('rachis_detection', {})
@@ -843,11 +847,83 @@ class WheatSpikeAnalyzerOBB:
         
         try:
             model = YOLO(model_path)
-            logger.info(f"✓ Détecteur rachis chargé: {model_path}")
+            cfg_task = str(rachis_config.get('task', 'auto')).lower()
+            model_task = getattr(model, 'task', None) or cfg_task
+            if cfg_task != 'auto':
+                model_task = cfg_task
+            if model_task not in ('pose', 'segment'):
+                model_task = 'segment'
+            self.rachis_model_task = model_task
+            logger.info(f"✓ Modèle rachis chargé ({self.rachis_model_task}): {model_path}")
             return model
         except Exception as e:
             logger.warning(f"Erreur chargement modèle rachis: {e}")
             return None
+
+    def _extract_rachis_from_pose(
+        self,
+        yolo_results,
+        M: np.ndarray,
+        pixel_per_mm: Optional[float],
+    ) -> Optional[Dict]:
+        """Extrait une ligne de rachis depuis les keypoints YOLO-Pose."""
+        res = yolo_results[0]
+        if res.keypoints is None or len(res.keypoints) == 0:
+            return None
+
+        best_idx = 0
+        conf = 0.5
+        if res.boxes is not None and len(res.boxes) > 0:
+            best_idx = int(res.boxes.conf.argmax())
+            conf = float(res.boxes.conf[best_idx])
+
+        kpts_xy = res.keypoints.xy[best_idx].cpu().numpy()
+        valid = np.isfinite(kpts_xy).all(axis=1)
+
+        kpt_conf = getattr(res.keypoints, 'conf', None)
+        if kpt_conf is not None:
+            conf_row = kpt_conf[best_idx].cpu().numpy()
+            valid = valid & np.isfinite(conf_row) & (conf_row > 0.01)
+
+        pts_crop = kpts_xy[valid].astype(np.float64)
+        if len(pts_crop) < 2:
+            return None
+
+        diffs = np.diff(pts_crop, axis=0)
+        seg_lens = np.sqrt((diffs ** 2).sum(axis=1))
+        length_px = float(seg_lens.sum())
+        if length_px <= 0:
+            return None
+
+        # Densify the centerline so downstream tangent/angle code stays stable.
+        cum = np.concatenate([[0.0], np.cumsum(seg_lens)])
+        n_out = max(50, min(300, int(length_px)))
+        s_new = np.linspace(0.0, cum[-1], n_out)
+        x_new = np.interp(s_new, cum, pts_crop[:, 0])
+        y_new = np.interp(s_new, cum, pts_crop[:, 1])
+        skeleton_pts_crop = np.column_stack([x_new, y_new])
+
+        length_mm = None
+        if pixel_per_mm and pixel_per_mm > 0:
+            length_mm = length_px / pixel_per_mm
+
+        M_inv = cv2.invertAffineTransform(M)
+        pts_hom = np.hstack([
+            skeleton_pts_crop,
+            np.ones((len(skeleton_pts_crop), 1)),
+        ])
+        skeleton_pts_global = (M_inv @ pts_hom.T).T
+
+        return {
+            'detected': True,
+            'confidence': conf,
+            'kpts_crop': pts_crop.astype(np.int32),
+            'skeleton_pts_crop': skeleton_pts_crop.astype(np.int32),
+            'skeleton_pts_global': skeleton_pts_global.astype(np.int32),
+            'mask_contour_global': None,
+            'length_px': length_px,
+            'length_mm': length_mm,
+        }
     
     def _extract_rachis_from_yolo(
         self,
@@ -937,6 +1013,7 @@ class WheatSpikeAnalyzerOBB:
             mask_contour_global = (M_inv @ pts_c_hom.T).T.astype(np.int32)
         
         return {
+            'detected': True,
             'confidence': conf,
             'mask_crop': mask_crop,
             'skeleton_pts_crop': skeleton_pts_crop,
@@ -1168,9 +1245,8 @@ class WheatSpikeAnalyzerOBB:
             Liste de dicts par épillet avec attachment_point, insertion_angle_deg, etc.
         """
         skeleton_pts = rachis_info.get('skeleton_pts_global')
-        mask_contour = rachis_info.get('mask_contour_global')
         
-        if skeleton_pts is None or len(skeleton_pts) < 5 or mask_contour is None:
+        if skeleton_pts is None or len(skeleton_pts) < 5:
             return []
         
         # Ordonner le squelette le long du rachis (par arc-length)
@@ -2123,6 +2199,20 @@ class WheatSpikeAnalyzerOBB:
             'whole_spikes': [],
             'bags': [],
         }
+
+        # Compteurs de raisons de rejet pour des messages d'aide explicites.
+        rejection_reasons = {
+            'ruler': {},
+            'spikes': {},
+            'whole_spikes': {},
+            'bags': {},
+        }
+
+        def _add_rejection_reason(group: str, reason: str, n: int = 1) -> None:
+            if n <= 0:
+                return
+            bucket = rejection_reasons[group]
+            bucket[reason] = bucket.get(reason, 0) + n
         
         n_before = {k: len(v) for k, v in detections.items()}
         
@@ -2142,9 +2232,11 @@ class WheatSpikeAnalyzerOBB:
             area_ratio = det.area / img_area
             if ar < ruler_min_ar:
                 logger.debug(f"  Ruler rejeté: AR={ar:.1f} < {ruler_min_ar}")
+                _add_rejection_reason('ruler', 'aspect_ratio_trop_faible')
                 continue
             if area_ratio < ruler_min_area_ratio:
                 logger.debug(f"  Ruler rejeté: area_ratio={area_ratio:.4f} < {ruler_min_area_ratio}")
+                _add_rejection_reason('ruler', 'aire_trop_petite')
                 continue
             verified['ruler'].append(det)
         
@@ -2164,18 +2256,23 @@ class WheatSpikeAnalyzerOBB:
             
             if ar < spike_min_ar:
                 logger.debug(f"  Spike rejeté: AR={ar:.1f} < {spike_min_ar}")
+                _add_rejection_reason('spikes', 'aspect_ratio_trop_faible')
                 continue
             if ar > spike_max_ar:
                 logger.debug(f"  Spike rejeté: AR={ar:.1f} > {spike_max_ar}")
+                _add_rejection_reason('spikes', 'aspect_ratio_trop_eleve')
                 continue
             if area_ratio < spike_min_area_ratio:
                 logger.debug(f"  Spike rejeté: trop petit (area_ratio={area_ratio:.5f})")
+                _add_rejection_reason('spikes', 'aire_trop_petite')
                 continue
             if area_ratio > spike_max_area_ratio:
                 logger.debug(f"  Spike rejeté: trop grand (area_ratio={area_ratio:.4f})")
+                _add_rejection_reason('spikes', 'aire_trop_grande')
                 continue
             if det.height < spike_min_height_px:
                 logger.debug(f"  Spike rejeté: hauteur={det.height:.0f}px < {spike_min_height_px}px")
+                _add_rejection_reason('spikes', 'hauteur_trop_faible')
                 continue
             verified['spikes'].append(det)
         
@@ -2191,12 +2288,15 @@ class WheatSpikeAnalyzerOBB:
             
             if area_ratio < ws_min_area_ratio:
                 logger.debug(f"  Whole_spike rejeté: trop petit (area_ratio={area_ratio:.5f})")
+                _add_rejection_reason('whole_spikes', 'aire_trop_petite')
                 continue
             if area_ratio > ws_max_area_ratio:
                 logger.debug(f"  Whole_spike rejeté: trop grand (area_ratio={area_ratio:.4f})")
+                _add_rejection_reason('whole_spikes', 'aire_trop_grande')
                 continue
             if det.height < ws_min_height_px:
                 logger.debug(f"  Whole_spike rejeté: hauteur={det.height:.0f}px < {ws_min_height_px}px")
+                _add_rejection_reason('whole_spikes', 'hauteur_trop_faible')
                 continue
             verified['whole_spikes'].append(det)
         
@@ -2209,9 +2309,11 @@ class WheatSpikeAnalyzerOBB:
             area_ratio = det.area / img_area
             if area_ratio < bag_min_area_ratio:
                 logger.debug(f"  Bag rejeté: trop petit (area_ratio={area_ratio:.5f})")
+                _add_rejection_reason('bags', 'aire_trop_petite')
                 continue
             if area_ratio > bag_max_area_ratio:
                 logger.debug(f"  Bag rejeté: trop grand (area_ratio={area_ratio:.4f})")
+                _add_rejection_reason('bags', 'aire_trop_grande')
                 continue
             verified['bags'].append(det)
         
@@ -2220,6 +2322,8 @@ class WheatSpikeAnalyzerOBB:
         # ==== CROSS-CLASS : éliminer spikes/whole_spikes qui chevauchent la règle ====
         if verified['ruler']:
             ruler_det = verified['ruler'][0]
+            spikes_before_ruler = len(verified['spikes'])
+            whole_before_ruler = len(verified['whole_spikes'])
             verified['spikes'] = [
                 s for s in verified['spikes']
                 if self._obb_iou(s, ruler_det) < 0.3
@@ -2228,6 +2332,8 @@ class WheatSpikeAnalyzerOBB:
                 s for s in verified['whole_spikes']
                 if self._obb_iou(s, ruler_det) < 0.3
             ]
+            _add_rejection_reason('spikes', 'chevauche_regle', spikes_before_ruler - len(verified['spikes']))
+            _add_rejection_reason('whole_spikes', 'chevauche_regle', whole_before_ruler - len(verified['whole_spikes']))
         
         # ==== CROSS-CLASS : éliminer les spikes contenus dans un whole_spike ====
         # Un spike détecté à l'intérieur d'un whole_spike est un doublon (le whole_spike
@@ -2245,6 +2351,7 @@ class WheatSpikeAnalyzerOBB:
                             f"  Spike rejeté: contenu dans whole_spike "
                             f"(containment={containment:.2f} > {spike_in_ws_threshold})"
                         )
+                        _add_rejection_reason('spikes', 'contenu_dans_whole_spike')
                         is_contained = True
                         break
                 if not is_contained:
@@ -2262,16 +2369,28 @@ class WheatSpikeAnalyzerOBB:
         #   - Sinon, le petit est un doublon → supprimer le petit.
         spike_in_spike_threshold = verify_config.get('spike_inside_spike_threshold', 0.6)
         nested_max_area_ratio = verify_config.get('nested_max_area_ratio', 5.0)
+        spikes_before_nested = len(verified['spikes'])
         verified['spikes'] = self._filter_nested_detections(
             verified['spikes'], spike_in_spike_threshold, label='spike',
             max_area_ratio=nested_max_area_ratio,
         )
+        _add_rejection_reason(
+            'spikes',
+            'doublon_spike_imbrique',
+            spikes_before_nested - len(verified['spikes'])
+        )
         
         # ==== INTRA-CLASS : éliminer les whole_spikes contenus dans d'autres whole_spikes ====
         ws_in_ws_threshold = verify_config.get('whole_spike_inside_whole_spike_threshold', 0.6)
+        whole_before_nested = len(verified['whole_spikes'])
         verified['whole_spikes'] = self._filter_nested_detections(
             verified['whole_spikes'], ws_in_ws_threshold, label='whole_spike',
             max_area_ratio=nested_max_area_ratio,
+        )
+        _add_rejection_reason(
+            'whole_spikes',
+            'doublon_whole_spike_imbrique',
+            whole_before_nested - len(verified['whole_spikes'])
         )
         
         # Log des rejets
@@ -2280,6 +2399,19 @@ class WheatSpikeAnalyzerOBB:
         if total_rejected > 0:
             details = ", ".join(f"{k}: {n_before[k]}→{n_after[k]}" for k in n_before if n_before[k] != n_after[k])
             logger.info(f"  Vérification: {total_rejected} détection(s) rejetée(s) [{details}]")
+
+        # Message d'aide utilisateur: raisons agrégées de rejet des spikes.
+        spike_reasons = rejection_reasons['spikes']
+        if spike_reasons:
+            reason_details = ", ".join(f"{k}={v}" for k, v in sorted(spike_reasons.items()))
+            logger.info(f"  Aide rejet spikes: {reason_details}")
+
+        # Si tous les spikes ont été rejetés, afficher un message explicite.
+        if n_before['spikes'] > 0 and n_after['spikes'] == 0:
+            logger.warning(
+                "  Tous les spikes détectés ont été rejetés par la vérification géométrique. "
+                "Consultez 'Aide rejet spikes' et ajustez si besoin yolo.detection_verification.spike.* dans config.yaml"
+            )
         
         return verified
     
@@ -4173,7 +4305,7 @@ class WheatSpikeAnalyzerOBB:
             gc.collect()
             
             # =====================================================================
-            # ÉTAPE 8: DÉTECTION DU RACHIS (YOLO-Seg)
+            # ÉTAPE 8: DÉTECTION DU RACHIS (YOLO-Pose / YOLO-Seg)
             # =====================================================================
             if self.rachis_detector is not None:
                 rachis_config = self.config.get('rachis_detection', {})
@@ -4208,8 +4340,15 @@ class WheatSpikeAnalyzerOBB:
                         borderValue=(0, 0, 0),
                     )
                     
-                    # --- Inférence YOLO-Seg sur le crop (avec ou sans TTA) ---
-                    if self.use_tta_rachis:
+                    # --- Inférence rachis sur le crop ---
+                    if self.rachis_model_task == 'pose':
+                        rachis_results = self.rachis_detector(
+                            crop, conf=rachis_conf, verbose=False
+                        )
+                        rachis_info = self._extract_rachis_from_pose(
+                            rachis_results, M, self.pixel_per_mm
+                        )
+                    elif self.use_tta_rachis:
                         try:
                             from .tta import tta_rachis_segment
                         except ImportError:
