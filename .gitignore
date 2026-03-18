@@ -45,17 +45,9 @@ data/*.png
 data/*.PNG
 
 # ── Training datasets ────────────────────────────────────────────────────────
-# Exclure entièrement les dossiers d'entraînement (images + labels)
-# Les datasets sont trop volumineux pour git.
-# Reconstruire avec les scripts dans scripts/ si nécessaire.
-training_bag_digits/
-training_bag_opening/
-training_graduations/
-training_obb_angled/
-training_rachis/
-training_spikelets/
-training_spikelets_segmentation/
-training_spike_segmentation/
+# Exclure uniquement les images des datasets d'entraînement.
+# Les labels et data.yaml restent versionnables.
+training_*/images/
 
 # ── Output results ───────────────────────────────────────────────────────────
 output/
