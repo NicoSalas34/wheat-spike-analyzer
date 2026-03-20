@@ -47,7 +47,7 @@ data/*.PNG
 # ── Training datasets ────────────────────────────────────────────────────────
 # Exclure uniquement les images des datasets d'entraînement.
 # Les labels et data.yaml restent versionnables.
-training_*/images/
+training_*/
 
 # ── Output results ───────────────────────────────────────────────────────────
 output/

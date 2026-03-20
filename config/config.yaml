@@ -15,9 +15,30 @@ yolo:
   ruler_confidence_threshold: 0.15
   # Classes OBB: 0=ruler, 1=spike, 2=bag, 3=whole_spike
   # TTA: support natif Ultralytics (augment=True). Note: pas supporté par tous
-  # les modèles OBB. Désactivé par défaut.
+  # les modèles OBB. `mode: custom` active un TTA maison avec consensus OBB.
   tta:
-    enabled: false
+    enabled: true
+    mode: 'custom'              # 'custom' (recommandé OBB) | 'native' (augment=True Ultralytics)
+    augmentations:
+      - original
+      - flip_h
+      - flip_v
+      - rot180
+      - brightness_up
+      - contrast_up
+      - brightness_down
+      - contrast_down
+      - hue_shift
+      - saturation_up
+      - saturation_down
+    cluster_iou: 0.25           # IoU OBB pour regrouper les bbox entre augmentations
+    nms_iou: 0.45               # NMS final après consensus
+    min_votes: 1                # Nombre min de votes (augmentations) pour garder un objet
+    augmentation_weights:       # Pondération optionnelle par augmentation
+      original: 1.0
+      flip_h: 1.0
+      flip_v: 1.0
+      rot180: 1.0
   # Inférence par tuiles (sliced inference) pour améliorer la détection
   # des épis longs sur les images haute résolution (5568×4872).
   # Découpe l'image en tuiles avec chevauchement + inférence full-image,
@@ -25,7 +46,7 @@ yolo:
   sliced_inference:
     enabled: false              # Activer l'inférence par tuiles
     slice_size: 1280           # Taille de chaque tuile en pixels
-    overlap_ratio: 0.25        # Chevauchement entre tuiles (25%)
+    overlap_ratio: 0.50       # Chevauchement entre tuiles (50%)
     # Résolution d'inférence (imgsz) pour le pass full-image.
     # Plus c'est grand, meilleure est la détection des épis longs,
     # mais plus c'est lent et gourmand en VRAM.
@@ -56,8 +77,8 @@ yolo:
       min_area_ratio: 0.005       # Au moins 0.5% de l'image
       max_count: 1                # Au maximum 2 règles (normalement 1)
     spike:
-      min_aspect_ratio: 1.5       # L'épi est allongé (pas carré)
-      max_aspect_ratio: 25.0      # Pas trop extrême
+      min_aspect_ratio: 1       # L'épi est allongé (pas carré)
+      max_aspect_ratio: 100.0      # Pas trop extrême
       min_area_ratio: 0    # Au moins 0.05% de l'image
       max_area_ratio: 1        # Pas plus de 15% de l'image
       min_height_px: 80           # Au moins 80px de hauteur
@@ -119,6 +140,13 @@ spikelet_counting:
       - flip_h
       - flip_v
       - rot180
+      - brightness_up
+      - brightness_down
+      - contrast_up
+      - contrast_down
+      - hue_shift
+      - saturation_up
+      - saturation_down
   segmentation:                 # Segmentation individuelle des épillets via SAM2
     enabled: true               # Activer pour obtenir taille/forme/aire par épillet
 
@@ -142,6 +170,11 @@ segmentation:
       - rot180
       - brightness_up
       - contrast_up
+      - brightness_down
+      - contrast_down
+      - hue_shift
+      - saturation_up
+      - saturation_down
 
 # =============================================================================
 # APPARIEMENT SPIKE ↔ WHOLE_SPIKE
@@ -172,6 +205,11 @@ bag_digits:
       - rot180
       - brightness_up
       - contrast_up
+      - brightness_down
+      - contrast_down
+      - hue_shift
+      - saturation_up
+      - saturation_down
 
 # =============================================================================
 # DÉTECTION DU RACHIS (YOLO-Pose)
@@ -179,8 +217,8 @@ bag_digits:
 # Modèle YOLO-Pose entraîné sur le rachis (5 keypoints).
 rachis_detection:
   enabled: true
-  task: 'pose'
-  model_path: 'runs/pose/runs/rachis_yolo11n_pose/weights/best.pt'
+  task: 'auto'
+  model_path: 'models/rachis_yolo.pt'
   confidence_threshold: 0.2
   crop_margin: 30               # Marge autour de l'OBB pour le crop (pixels)
   # TTA (segment): ignoré automatiquement en mode pose
@@ -193,6 +231,11 @@ rachis_detection:
       - rot180
       - brightness_up
       - contrast_up
+      - brightness_down
+      - contrast_down
+      - hue_shift
+      - saturation_up
+      - saturation_down
     consensus_threshold: 0.4
 
 # =============================================================================

@@ -25,7 +25,15 @@ logger = logging.getLogger(__name__)
 GEOMETRIC_AUGMENTATIONS = ['original', 'flip_h', 'flip_v', 'rot180']
 
 # Photometric augmentations (no geometry change)
-PHOTOMETRIC_AUGMENTATIONS = ['brightness_up', 'brightness_down', 'contrast_up']
+PHOTOMETRIC_AUGMENTATIONS = [
+    'brightness_up',
+    'brightness_down',
+    'contrast_up',
+    'contrast_down',
+    'hue_shift',
+    'saturation_up',
+    'saturation_down',
+]
 
 # All augmentations suitable for mask-based TTA
 MASK_TTA_AUGMENTATIONS = GEOMETRIC_AUGMENTATIONS + PHOTOMETRIC_AUGMENTATIONS
@@ -95,6 +103,50 @@ def apply_augmentation(image: np.ndarray, aug_name: str):
     
     elif aug_name == 'contrast_up':
         aug = cv2.convertScaleAbs(image, alpha=1.3, beta=0)
+        return (
+            aug,
+            lambda m: m,
+            lambda x1, y1, x2, y2: (x1, y1, x2, y2),
+        )
+
+    elif aug_name == 'contrast_down':
+        aug = cv2.convertScaleAbs(image, alpha=0.75, beta=0)
+        return (
+            aug,
+            lambda m: m,
+            lambda x1, y1, x2, y2: (x1, y1, x2, y2),
+        )
+
+    elif aug_name == 'hue_shift':
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        h = hsv[:, :, 0].astype(np.int16)
+        h = (h + 10) % 180
+        hsv[:, :, 0] = h.astype(np.uint8)
+        aug = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+        return (
+            aug,
+            lambda m: m,
+            lambda x1, y1, x2, y2: (x1, y1, x2, y2),
+        )
+
+    elif aug_name == 'saturation_up':
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        s = hsv[:, :, 1].astype(np.float32)
+        s = np.clip(s * 1.25, 0, 255)
+        hsv[:, :, 1] = s.astype(np.uint8)
+        aug = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+        return (
+            aug,
+            lambda m: m,
+            lambda x1, y1, x2, y2: (x1, y1, x2, y2),
+        )
+
+    elif aug_name == 'saturation_down':
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        s = hsv[:, :, 1].astype(np.float32)
+        s = np.clip(s * 0.75, 0, 255)
+        hsv[:, :, 1] = s.astype(np.uint8)
+        aug = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
         return (
             aug,
             lambda m: m,
@@ -400,6 +452,360 @@ def tta_yolo_detect(
             })
     
     return final
+
+
+def _inverse_transform_points(points: np.ndarray, aug_name: str, h: int, w: int) -> np.ndarray:
+    """Inverse geometric transform for Nx2 points back to original image space."""
+    pts = points.astype(np.float32).copy()
+
+    if aug_name == 'original':
+        pts[:, 0] = np.clip(pts[:, 0], 0.0, float(w - 1))
+        pts[:, 1] = np.clip(pts[:, 1], 0.0, float(h - 1))
+        return pts
+    if aug_name == 'flip_h':
+        pts[:, 0] = (w - 1) - pts[:, 0]
+        pts[:, 0] = np.clip(pts[:, 0], 0.0, float(w - 1))
+        pts[:, 1] = np.clip(pts[:, 1], 0.0, float(h - 1))
+        return pts
+    if aug_name == 'flip_v':
+        pts[:, 1] = (h - 1) - pts[:, 1]
+        pts[:, 0] = np.clip(pts[:, 0], 0.0, float(w - 1))
+        pts[:, 1] = np.clip(pts[:, 1], 0.0, float(h - 1))
+        return pts
+    if aug_name == 'rot180':
+        pts[:, 0] = (w - 1) - pts[:, 0]
+        pts[:, 1] = (h - 1) - pts[:, 1]
+        pts[:, 0] = np.clip(pts[:, 0], 0.0, float(w - 1))
+        pts[:, 1] = np.clip(pts[:, 1], 0.0, float(h - 1))
+        return pts
+    # Photometric augs (or unknown) have no geometric change.
+    pts[:, 0] = np.clip(pts[:, 0], 0.0, float(w - 1))
+    pts[:, 1] = np.clip(pts[:, 1], 0.0, float(h - 1))
+    return pts
+
+
+def _canonical_obb_from_points(points: np.ndarray) -> Dict:
+    """Build a canonical OBB representation from 4+ points via minAreaRect."""
+    pts = points.astype(np.float32).reshape(-1, 1, 2)
+    rect = cv2.minAreaRect(pts)
+    (cx, cy), (w, h), angle = rect
+
+    length = max(w, h)
+    width = min(w, h)
+    adjusted_angle = float(angle)
+    if w > h:
+        adjusted_angle += 90.0
+
+    box_pts = cv2.boxPoints(rect).astype(np.float32)
+    return {
+        'obb_points': box_pts,
+        'center': (float(cx), float(cy)),
+        'width': float(width),
+        'height': float(length),
+        'angle': adjusted_angle,
+    }
+
+
+def _obb_iou_dict(det_a: Dict, det_b: Dict) -> float:
+    """IoU between two oriented boxes represented as dicts."""
+    rect_a = (det_a['center'], (det_a['width'], det_a['height']), det_a['angle'])
+    rect_b = (det_b['center'], (det_b['width'], det_b['height']), det_b['angle'])
+
+    try:
+        ret, pts = cv2.rotatedRectangleIntersection(rect_a, rect_b)
+        if ret == cv2.INTERSECT_NONE or pts is None:
+            return 0.0
+        inter = cv2.contourArea(pts)
+        area_a = det_a['width'] * det_a['height']
+        area_b = det_b['width'] * det_b['height']
+        union = area_a + area_b - inter
+        return float(inter / union) if union > 0 else 0.0
+    except Exception:
+        return 0.0
+
+
+def _nms_obb_dict(detections: List[Dict], iou_threshold: float) -> List[Dict]:
+    """Simple OBB NMS on dict detections."""
+    if len(detections) <= 1:
+        return detections
+
+    dets = sorted(detections, key=lambda d: d.get('confidence', 0.0), reverse=True)
+    kept = []
+    while dets:
+        best = dets.pop(0)
+        kept.append(best)
+        remaining = []
+        for det in dets:
+            same_class = det.get('class_id') == best.get('class_id')
+            if (not same_class) or _obb_iou_dict(best, det) < iou_threshold:
+                remaining.append(det)
+        dets = remaining
+    return kept
+
+
+def _weighted_consensus_obb(cluster: List[Dict]) -> Dict:
+    """Compute confidence-weighted OBB consensus from a cluster."""
+    if len(cluster) == 1:
+        det = cluster[0].copy()
+        det['n_votes'] = 1
+        det['support_ratio'] = 1.0
+        return det
+
+    weights = np.array([
+        max(1e-6, float(d.get('vote_weight', d.get('confidence', 0.0))))
+        for d in cluster
+    ], dtype=np.float64)
+    total_w = float(weights.sum())
+
+    cx = float(np.average([d['center'][0] for d in cluster], weights=weights))
+    cy = float(np.average([d['center'][1] for d in cluster], weights=weights))
+    width = float(np.average([d['width'] for d in cluster], weights=weights))
+    height = float(np.average([d['height'] for d in cluster], weights=weights))
+
+    # Orientation robuste via PCA pondérée sur les coins OBB.
+    # Cela évite l'ambiguïté ±90° des angles de rectangles orientés.
+    corner_points = []
+    corner_weights = []
+    for det, w in zip(cluster, weights):
+        pts = np.array(det.get('obb_points', []), dtype=np.float64).reshape(-1, 2)
+        if pts.shape[0] >= 4:
+            corner_points.append(pts)
+            corner_weights.extend([float(w)] * pts.shape[0])
+
+    if corner_points:
+        pts_all = np.vstack(corner_points)
+        w_all = np.array(corner_weights, dtype=np.float64)
+        w_sum = float(w_all.sum())
+        if w_sum > 0:
+            mu = np.average(pts_all, axis=0, weights=w_all)
+            centered = pts_all - mu
+            cov = (centered * w_all[:, None]).T @ centered / w_sum
+            eigvals, eigvecs = np.linalg.eigh(cov)
+            major_vec = eigvecs[:, int(np.argmax(eigvals))]
+            mean_angle = float(np.rad2deg(np.arctan2(major_vec[1], major_vec[0])))
+        else:
+            mean_angle = float(cluster[0].get('angle', 0.0))
+    else:
+        mean_angle = float(cluster[0].get('angle', 0.0))
+
+    # Build box from weighted parameters, then canonicalize with minAreaRect.
+    major = np.array([np.cos(np.deg2rad(mean_angle)), np.sin(np.deg2rad(mean_angle))], dtype=np.float32)
+    minor = np.array([-major[1], major[0]], dtype=np.float32)
+    c = np.array([cx, cy], dtype=np.float32)
+    half_h = 0.5 * height
+    half_w = 0.5 * width
+    box_pts = np.array([
+        c - major * half_h - minor * half_w,
+        c - major * half_h + minor * half_w,
+        c + major * half_h + minor * half_w,
+        c + major * half_h - minor * half_w,
+    ], dtype=np.float32)
+
+    canonical = _canonical_obb_from_points(box_pts)
+    confidence_mean = float(np.mean([d.get('confidence', 0.0) for d in cluster]))
+    confidence_boost = float(min(1.0, total_w / max(1e-6, len(cluster))))
+    confidence_final = float(max(0.0, min(1.0, confidence_mean * (0.5 + 0.5 * confidence_boost))))
+
+    return {
+        **canonical,
+        'class_id': int(cluster[0]['class_id']),
+        'class_name': cluster[0].get('class_name', f"class_{int(cluster[0]['class_id'])}"),
+        'confidence': confidence_final,
+        'n_votes': int(len(cluster)),
+        'source': 'tta_consensus',
+    }
+
+
+def tta_yolo_obb(
+    model,
+    image: np.ndarray,
+    conf: float,
+    iou: float,
+    imgsz: int = 1024,
+    augmentations: Optional[List[str]] = None,
+    augmentation_weights: Optional[Dict[str, float]] = None,
+    cluster_iou: float = 0.25,
+    nms_iou: float = 0.45,
+    min_votes: int = 1,
+) -> List[Dict]:
+    """Custom TTA for YOLO-OBB with confidence-weighted geometric consensus.
+
+    Workflow:
+    1) Run inference for each augmentation image.
+    2) Back-transform each OBB to original image coordinates.
+    3) Cluster overlapping OBBs per class.
+    4) Build a confidence-weighted consensus OBB for each cluster.
+    5) Apply final OBB NMS.
+    """
+    if augmentations is None:
+        augmentations = GEOMETRIC_AUGMENTATIONS
+
+    h, w = image.shape[:2]
+    all_dets: List[Dict] = []
+
+    for aug_name in augmentations:
+        aug_image, _, _ = apply_augmentation(image, aug_name)
+        if aug_image is None:
+            continue
+
+        try:
+            results = model.predict(
+                source=aug_image,
+                conf=conf,
+                iou=iou,
+                verbose=False,
+                half=False,
+                augment=False,
+                imgsz=imgsz,
+            )
+        except Exception as e:
+            logger.warning(f"TTA OBB failed for {aug_name}: {e}")
+            continue
+
+        aug_weight = 1.0
+        if augmentation_weights:
+            aug_weight = float(augmentation_weights.get(aug_name, 1.0))
+
+        for res in results:
+            if hasattr(res, 'obb') and res.obb is not None and res.obb.data is not None:
+                pts_batch = None
+                conf_batch = None
+                cls_batch = None
+
+                if hasattr(res.obb, 'xyxyxyxy') and res.obb.xyxyxyxy is not None:
+                    try:
+                        pts_batch = res.obb.xyxyxyxy.cpu().numpy()
+                    except Exception:
+                        pts_batch = None
+
+                if hasattr(res.obb, 'conf') and res.obb.conf is not None:
+                    try:
+                        conf_batch = res.obb.conf.cpu().numpy()
+                    except Exception:
+                        conf_batch = None
+
+                if hasattr(res.obb, 'cls') and res.obb.cls is not None:
+                    try:
+                        cls_batch = res.obb.cls.cpu().numpy()
+                    except Exception:
+                        cls_batch = None
+
+                if pts_batch is not None and len(pts_batch) > 0:
+                    n = len(pts_batch)
+                    for i_row in range(n):
+                        pts_aug = np.array(pts_batch[i_row], dtype=np.float32).reshape(-1, 2)
+                        if pts_aug.shape[0] < 4:
+                            continue
+
+                        if conf_batch is not None and i_row < len(conf_batch):
+                            conf_val = float(conf_batch[i_row])
+                        else:
+                            conf_val = 0.5
+
+                        if cls_batch is not None and i_row < len(cls_batch):
+                            class_id = int(cls_batch[i_row])
+                        else:
+                            class_id = -1
+
+                        pts_orig = _inverse_transform_points(pts_aug, aug_name, h, w)
+                        pts_orig[:, 0] = np.clip(pts_orig[:, 0], 0.0, float(w - 1))
+                        pts_orig[:, 1] = np.clip(pts_orig[:, 1], 0.0, float(h - 1))
+                        canonical = _canonical_obb_from_points(pts_orig)
+
+                        all_dets.append({
+                            **canonical,
+                            'class_id': class_id,
+                            'class_name': f"class_{class_id}",
+                            'confidence': conf_val,
+                            'vote_weight': max(1e-6, conf_val * aug_weight),
+                            'aug_name': aug_name,
+                            'source': 'tta_raw',
+                        })
+                else:
+                    # Fallback: reconstruire les coins depuis cx,cy,w,h,angle.
+                    obb_data = res.obb.data
+                    for i_row in range(len(obb_data)):
+                        row = obb_data[i_row].cpu().numpy()
+                        cx, cy, bw, bh, angle_rad, confidence, class_id = row
+                        class_id = int(class_id)
+                        angle_deg = float(angle_rad) * 180.0 / np.pi
+                        rect = ((float(cx), float(cy)), (float(bw), float(bh)), angle_deg)
+                        pts_aug = cv2.boxPoints(rect).astype(np.float32)
+                        pts_orig = _inverse_transform_points(pts_aug, aug_name, h, w)
+                        pts_orig[:, 0] = np.clip(pts_orig[:, 0], 0.0, float(w - 1))
+                        pts_orig[:, 1] = np.clip(pts_orig[:, 1], 0.0, float(h - 1))
+                        canonical = _canonical_obb_from_points(pts_orig)
+                        conf_val = float(confidence)
+
+                        all_dets.append({
+                            **canonical,
+                            'class_id': class_id,
+                            'class_name': f"class_{class_id}",
+                            'confidence': conf_val,
+                            'vote_weight': max(1e-6, conf_val * aug_weight),
+                            'aug_name': aug_name,
+                            'source': 'tta_raw',
+                        })
+            elif hasattr(res, 'boxes') and res.boxes is not None:
+                for box in res.boxes:
+                    class_id = int(box.cls[0])
+                    conf_val = float(box.conf[0])
+                    x1, y1, x2, y2 = map(float, box.xyxy[0].tolist())
+                    pts_aug = np.array(
+                        [[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
+                        dtype=np.float32,
+                    )
+                    pts_orig = _inverse_transform_points(pts_aug, aug_name, h, w)
+                    canonical = _canonical_obb_from_points(pts_orig)
+                    all_dets.append({
+                        **canonical,
+                        'class_id': class_id,
+                        'class_name': f"class_{class_id}",
+                        'confidence': conf_val,
+                        'vote_weight': max(1e-6, conf_val * aug_weight),
+                        'aug_name': aug_name,
+                        'source': 'tta_raw',
+                    })
+
+    if not all_dets:
+        return []
+
+    final_consensus: List[Dict] = []
+    classes = sorted(set(int(d['class_id']) for d in all_dets))
+
+    for class_id in classes:
+        class_dets = [d for d in all_dets if int(d['class_id']) == class_id]
+        class_dets = sorted(class_dets, key=lambda d: d.get('vote_weight', d.get('confidence', 0.0)), reverse=True)
+        consumed = set()
+
+        for idx, anchor in enumerate(class_dets):
+            if idx in consumed:
+                continue
+
+            cluster_indices = [idx]
+            for j in range(idx + 1, len(class_dets)):
+                if j in consumed:
+                    continue
+                if _obb_iou_dict(anchor, class_dets[j]) >= cluster_iou:
+                    cluster_indices.append(j)
+
+            cluster = [class_dets[k] for k in cluster_indices]
+            for k in cluster_indices:
+                consumed.add(k)
+
+            if len(cluster) < min_votes:
+                continue
+
+            consensus = _weighted_consensus_obb(cluster)
+            consensus['support_ratio'] = float(len(cluster)) / float(max(1, len(augmentations)))
+            final_consensus.append(consensus)
+
+    final_consensus = _nms_obb_dict(final_consensus, iou_threshold=nms_iou)
+    logger.debug(
+        "TTA OBB custom: %d raw dets from %d augs -> %d consensus dets",
+        len(all_dets), len(augmentations), len(final_consensus),
+    )
+    return final_consensus
 
 
 # =============================================================================

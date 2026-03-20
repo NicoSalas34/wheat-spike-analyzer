@@ -136,6 +136,14 @@ class WheatSpikeAnalyzerOBB:
         # Étape 1: OBB detection (augment=True Ultralytics)
         obb_tta = self.config.get('yolo', {}).get('tta', {})
         self.use_tta_obb = obb_tta.get('enabled', False)
+        self.obb_tta_mode = str(obb_tta.get('mode', 'custom')).lower()
+        self.obb_tta_augmentations = obb_tta.get(
+            'augmentations', ['original', 'flip_h', 'flip_v', 'rot180']
+        )
+        self.obb_tta_cluster_iou = float(obb_tta.get('cluster_iou', 0.25))
+        self.obb_tta_nms_iou = float(obb_tta.get('nms_iou', 0.45))
+        self.obb_tta_min_votes = int(obb_tta.get('min_votes', 1))
+        self.obb_tta_augmentation_weights = obb_tta.get('augmentation_weights', {})
         
         # Étape 5: Spike segmentation
         seg_tta = self.config.get('segmentation', {}).get('tta', {})
@@ -1767,16 +1775,49 @@ class WheatSpikeAnalyzerOBB:
         
         # --- 1. Inférence full-image (capture les grands objets) ---
         logger.info(f"  Sliced: inférence full-image ({w}×{h}, imgsz={full_image_imgsz})...")
-        full_results = self.detector.predict(
-            source=image,
-            conf=conf_threshold,
-            iou=iou_threshold,
-            verbose=False,
-            half=False,
-            augment=use_tta,
-            imgsz=full_image_imgsz,
-        )
-        full_detections = self._parse_obb_results(full_results)
+        if use_tta and self.obb_tta_mode == 'custom':
+            try:
+                from .tta import tta_yolo_obb
+            except ImportError:
+                from tta import tta_yolo_obb
+
+            tta_dets = tta_yolo_obb(
+                model=self.detector,
+                image=image,
+                conf=conf_threshold,
+                iou=iou_threshold,
+                imgsz=full_image_imgsz,
+                augmentations=self.obb_tta_augmentations,
+                augmentation_weights=self.obb_tta_augmentation_weights,
+                cluster_iou=self.obb_tta_cluster_iou,
+                nms_iou=self.obb_tta_nms_iou,
+                min_votes=self.obb_tta_min_votes,
+            )
+            full_detections = []
+            for td in tta_dets:
+                class_id = int(td.get('class_id', -1))
+                full_detections.append(OBBDetection(
+                    class_id=class_id,
+                    class_name=CLASS_NAMES.get(class_id, f"class_{class_id}"),
+                    confidence=float(td.get('confidence', 0.0)),
+                    obb_points=np.array(td['obb_points'], dtype=np.float32),
+                    center=(float(td['center'][0]), float(td['center'][1])),
+                    width=float(td['width']),
+                    height=float(td['height']),
+                    angle=float(td['angle']),
+                    source='tta_consensus',
+                ))
+        else:
+            full_results = self.detector.predict(
+                source=image,
+                conf=conf_threshold,
+                iou=iou_threshold,
+                verbose=False,
+                half=False,
+                augment=use_tta,
+                imgsz=full_image_imgsz,
+            )
+            full_detections = self._parse_obb_results(full_results)
         n_full = len(full_detections)
         for d in full_detections:
             d.source = 'full'
@@ -2128,16 +2169,50 @@ class WheatSpikeAnalyzerOBB:
         else:
             # Inférence standard sur l'image complète
             full_imgsz = yolo_config.get('imgsz', 1024)
-            results = self.detector.predict(
-                source=image,
-                conf=conf_threshold,
-                iou=iou_threshold,
-                verbose=False,
-                half=False,  # Compatibilité ROCm
-                augment=use_tta,  # TTA Ultralytics: multi-scale + flips
-                imgsz=full_imgsz,
-            )
-            all_dets = self._parse_obb_results(results)
+            if use_tta and self.obb_tta_mode == 'custom':
+                try:
+                    from .tta import tta_yolo_obb
+                except ImportError:
+                    from tta import tta_yolo_obb
+
+                tta_dets = tta_yolo_obb(
+                    model=self.detector,
+                    image=image,
+                    conf=conf_threshold,
+                    iou=iou_threshold,
+                    imgsz=full_imgsz,
+                    augmentations=self.obb_tta_augmentations,
+                    augmentation_weights=self.obb_tta_augmentation_weights,
+                    cluster_iou=self.obb_tta_cluster_iou,
+                    nms_iou=self.obb_tta_nms_iou,
+                    min_votes=self.obb_tta_min_votes,
+                )
+
+                all_dets = []
+                for td in tta_dets:
+                    class_id = int(td.get('class_id', -1))
+                    all_dets.append(OBBDetection(
+                        class_id=class_id,
+                        class_name=CLASS_NAMES.get(class_id, f"class_{class_id}"),
+                        confidence=float(td.get('confidence', 0.0)),
+                        obb_points=np.array(td['obb_points'], dtype=np.float32),
+                        center=(float(td['center'][0]), float(td['center'][1])),
+                        width=float(td['width']),
+                        height=float(td['height']),
+                        angle=float(td['angle']),
+                        source='tta_consensus',
+                    ))
+            else:
+                results = self.detector.predict(
+                    source=image,
+                    conf=conf_threshold,
+                    iou=iou_threshold,
+                    verbose=False,
+                    half=False,  # Compatibilité ROCm
+                    augment=use_tta,  # TTA Ultralytics: multi-scale + flips
+                    imgsz=full_imgsz,
+                )
+                all_dets = self._parse_obb_results(results)
         
         # Classer par type
         detections = {
@@ -4441,7 +4516,11 @@ class WheatSpikeAnalyzerOBB:
                 if self.debug_level >= 2:
                     self.save_debug_08_insertion_angles(image, spike_results, session_dir)
             else:
-                logger.info("[8/10] Détection du rachis: désactivée")
+                rachis_enabled_cfg = self.config.get('rachis_detection', {}).get('enabled', False)
+                if rachis_enabled_cfg:
+                    logger.info("[8/10] Détection du rachis: indisponible (modèle non chargé) — vérifier model_path")
+                else:
+                    logger.info("[8/10] Détection du rachis: désactivée (config)")
                 for result in spike_results:
                     result['rachis'] = None
                     result['insertion_angles'] = []

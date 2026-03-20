@@ -324,14 +324,12 @@ class SpikeletCounter:
         
         Applique plusieurs transformations géométriques, exécute l'inférence
         sur chaque variante, projette les détections dans l'espace original,
-        puis agrège avec Weighted Box Fusion (WBF) / NMS.
+        puis agrège via la logique de consensus/NMS de `tta.py`.
         
         Args:
             roi: Image du ROI de l'épi (BGR)
-            augmentations: Liste de transformations parmi:
-                'original', 'flip_h', 'flip_v', 'rot180',
-                'rot90_cw', 'rot90_ccw'
-                Défaut: ['original', 'flip_h', 'flip_v', 'rot180']
+            augmentations: Liste de transformations supportées par `tta.py`
+                (par défaut: ['original', 'flip_h', 'flip_v', 'rot180'])
             nms_iou_tta: Seuil IoU pour le NMS d'agrégation TTA
             
         Returns:
@@ -339,131 +337,36 @@ class SpikeletCounter:
         """
         if augmentations is None:
             augmentations = ['original', 'flip_h', 'flip_v', 'rot180']
-        
-        h, w = roi.shape[:2]
-        all_boxes = []  # (x1, y1, x2, y2, score)
-        
-        for aug_name in augmentations:
-            # Appliquer la transformation
-            aug_image, inverse_fn = self._apply_augmentation(roi, aug_name)
-            
-            if aug_image is None:
-                continue
-            
-            # Inférence YOLO
-            count, bboxes, _masks = self.count_yolo(aug_image)
-            
-            # Projeter les bboxes dans l'espace original
-            for (bx1, by1, bx2, by2) in bboxes:
-                orig_bbox = inverse_fn(bx1, by1, bx2, by2)
-                if orig_bbox is not None:
-                    ox1, oy1, ox2, oy2 = orig_bbox
-                    # Clamp dans les limites de l'image originale
-                    ox1 = max(0, min(w - 1, ox1))
-                    oy1 = max(0, min(h - 1, oy1))
-                    ox2 = max(0, min(w - 1, ox2))
-                    oy2 = max(0, min(h - 1, oy2))
-                    if ox2 > ox1 and oy2 > oy1:
-                        # Score pondéré par 1/n_augmentations
-                        score = 1.0 / len(augmentations)
-                        all_boxes.append((ox1, oy1, ox2, oy2, score))
-        
-        if not all_boxes:
+
+        try:
+            from .tta import tta_yolo_detect
+        except ImportError:
+            from tta import tta_yolo_detect
+
+        detections = tta_yolo_detect(
+            model=self.model,
+            image=roi,
+            conf=self.confidence,
+            augmentations=augmentations,
+            nms_iou=nms_iou_tta,
+            cluster_iou=0.3,
+        )
+
+        if not detections:
             return 0, []
-        
-        # Agrégation via Weighted NMS
-        boxes = [b[:4] for b in all_boxes]
-        scores = [b[4] for b in all_boxes]
-        keep_idxs = self._nms(boxes, scores, iou_threshold=nms_iou_tta)
-        
-        # Pour chaque boîte gardée, calculer la boîte moyenne pondérée
-        # des boîtes qui lui étaient proches (soft-NMS-like averaging)
+
         final_bboxes = []
-        for idx in keep_idxs:
-            anchor = all_boxes[idx]
-            ax1, ay1, ax2, ay2 = anchor[:4]
-            
-            # Trouver toutes les boîtes proches
-            cluster_boxes = []
-            cluster_scores = []
-            for bx1, by1, bx2, by2, sc in all_boxes:
-                iou = self._compute_single_iou(
-                    (ax1, ay1, ax2, ay2), (bx1, by1, bx2, by2)
-                )
-                if iou > 0.3:  # Même cluster
-                    cluster_boxes.append((bx1, by1, bx2, by2))
-                    cluster_scores.append(sc)
-            
-            if cluster_boxes:
-                # Moyenne pondérée par les scores
-                total_score = sum(cluster_scores)
-                avg_x1 = sum(b[0] * s for b, s in zip(cluster_boxes, cluster_scores)) / total_score
-                avg_y1 = sum(b[1] * s for b, s in zip(cluster_boxes, cluster_scores)) / total_score
-                avg_x2 = sum(b[2] * s for b, s in zip(cluster_boxes, cluster_scores)) / total_score
-                avg_y2 = sum(b[3] * s for b, s in zip(cluster_boxes, cluster_scores)) / total_score
-                final_bboxes.append((int(avg_x1), int(avg_y1), int(avg_x2), int(avg_y2)))
-            else:
-                final_bboxes.append((int(ax1), int(ay1), int(ax2), int(ay2)))
-        
+        h, w = roi.shape[:2]
+        for det in detections:
+            x1, y1, x2, y2 = det.get('bbox', (0, 0, 0, 0))
+            x1 = int(max(0, min(w - 1, x1)))
+            y1 = int(max(0, min(h - 1, y1)))
+            x2 = int(max(0, min(w - 1, x2)))
+            y2 = int(max(0, min(h - 1, y2)))
+            if x2 > x1 and y2 > y1:
+                final_bboxes.append((x1, y1, x2, y2))
+
         return len(final_bboxes), final_bboxes
-    
-    def _apply_augmentation(
-        self, image: np.ndarray, aug_name: str
-    ) -> Tuple[Optional[np.ndarray], Optional[callable]]:
-        """
-        Applique une augmentation et retourne l'image transformée
-        ainsi que la fonction inverse pour reprojeter les bboxes.
-        
-        Args:
-            image: Image BGR
-            aug_name: Nom de l'augmentation
-            
-        Returns:
-            (image_augmentée, fonction_inverse)
-            La fonction inverse prend (x1, y1, x2, y2) et
-            retourne (x1', y1', x2', y2') dans l'espace original.
-        """
-        h, w = image.shape[:2]
-        
-        if aug_name == 'original':
-            return image, lambda x1, y1, x2, y2: (x1, y1, x2, y2)
-        
-        elif aug_name == 'flip_h':
-            aug = cv2.flip(image, 1)  # Flip horizontal
-            def inv_flip_h(x1, y1, x2, y2):
-                return (w - 1 - x2, y1, w - 1 - x1, y2)
-            return aug, inv_flip_h
-        
-        elif aug_name == 'flip_v':
-            aug = cv2.flip(image, 0)  # Flip vertical
-            def inv_flip_v(x1, y1, x2, y2):
-                return (x1, h - 1 - y2, x2, h - 1 - y1)
-            return aug, inv_flip_v
-        
-        elif aug_name == 'rot180':
-            aug = cv2.flip(image, -1)  # Rotation 180° = flip both
-            def inv_rot180(x1, y1, x2, y2):
-                return (w - 1 - x2, h - 1 - y2, w - 1 - x1, h - 1 - y1)
-            return aug, inv_rot180
-        
-        elif aug_name == 'rot90_cw':
-            # Rotation 90° horaire: (x,y) → (h-1-y, x)
-            aug = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
-            def inv_rot90_cw(x1, y1, x2, y2):
-                # Inverse: (x,y) → (y, w_aug-1-x) avec w_aug=h_orig
-                return (y1, h - 1 - x2, y2, h - 1 - x1)
-            return aug, inv_rot90_cw
-        
-        elif aug_name == 'rot90_ccw':
-            # Rotation 90° anti-horaire: (x,y) → (y, w-1-x)
-            aug = cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
-            def inv_rot90_ccw(x1, y1, x2, y2):
-                return (w - 1 - y2, x1, w - 1 - y1, x2)
-            return aug, inv_rot90_ccw
-        
-        else:
-            logger.warning(f"Augmentation inconnue: {aug_name}")
-            return None, None
     
     @staticmethod
     def _compute_single_iou(
