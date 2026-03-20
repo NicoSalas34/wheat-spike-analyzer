@@ -847,7 +847,12 @@ class WheatSpikeAnalyzerOBB:
             logger.info("Détection du rachis désactivée dans la config")
             return None
         
+        cfg_task = str(rachis_config.get('task', 'auto')).lower()
         model_path = rachis_config.get('model_path', 'models/rachis_yolo.pt')
+
+        # En mode pose, forcer l'usage du modèle YOLO-Pose dédié au rachis.
+        if cfg_task == 'pose':
+            model_path = rachis_config.get('pose_model_path', 'models/rachis_yolo_pose.pt')
         
         if not Path(model_path).exists():
             logger.warning(f"Modèle rachis non trouvé: {model_path}")
@@ -855,7 +860,6 @@ class WheatSpikeAnalyzerOBB:
         
         try:
             model = YOLO(model_path)
-            cfg_task = str(rachis_config.get('task', 'auto')).lower()
             model_task = getattr(model, 'task', None) or cfg_task
             if cfg_task != 'auto':
                 model_task = cfg_task
