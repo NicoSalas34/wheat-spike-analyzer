@@ -221,6 +221,12 @@ rachis_detection:
   model_path: 'models/rachis_yolo.pt'
   confidence_threshold: 0.2
   crop_margin: 30               # Marge autour de l'OBB pour le crop (pixels)
+  insertion_angle_filter:
+    # Tolérance maximale (en px) quand le point axe↔rachis tombe hors bbox épillet
+    # -> augmenter cette valeur si le filtre rejette trop d'angles valides
+    max_outside_bbox_px: 80
+    # Tolérance relative à la longueur de l'épillet (plus permissif sur grands épillets)
+    max_outside_bbox_ratio: 0.55
   # TTA (segment): ignoré automatiquement en mode pose
   tta:
     enabled: true

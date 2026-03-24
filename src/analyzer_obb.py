@@ -1182,40 +1182,88 @@ class WheatSpikeAnalyzerOBB:
     def _get_principal_axis(contour: np.ndarray) -> Optional[Tuple[float, float]]:
         """
         Calcule l'axe principal (direction du grand axe) d'un contour.
-        
-        Utilise fitEllipse en priorité (plus robuste que minAreaRect, surtout
-        quand l'aspect-ratio est faible). Repli sur minAreaRect si le
-        contour a moins de 5 points.
+
+        Approche hybride robuste:
+        - Axe ellipse (fitEllipse) quand possible
+        - Axe PCA sur les points du contour
+        - Fusion/adaptation selon l'anisotropie pour limiter les cas instables
+          (formes presque circulaires ou contours bruités).
         
         Returns:
             (dx, dy) vecteur unitaire de l'axe principal, ou None si impossible.
         """
         if contour is None or len(contour) < 3:
             return None
-        
+
+        pts = contour.reshape(-1, 2).astype(np.float64)
+
+        # PCA axis (toujours disponible dès 3 points)
+        pca_axis = None
+        pca_ratio = 1.0
+        try:
+            centered = pts - pts.mean(axis=0)
+            cov = (centered.T @ centered) / max(1, len(centered) - 1)
+            evals, evecs = np.linalg.eigh(cov)
+            major = evecs[:, -1]
+            n_major = np.linalg.norm(major)
+            if n_major > 1e-9:
+                pca_axis = major / n_major
+                l2 = float(max(evals[-1], 1e-12))
+                l1 = float(max(evals[-2], 1e-12))
+                pca_ratio = l2 / l1
+        except Exception:
+            pca_axis = None
+
+        # Ellipse axis (plus fidèle aux épillets ellipsoïdes quand la fit est stable)
+        ell_axis = None
+        ell_ratio = 1.0
         if len(contour) >= 5:
             try:
                 ell = cv2.fitEllipse(contour)
                 (_, _), (ell_w, ell_h), ell_angle = ell
-                # ell_angle est l'angle du premier axe (ell_w) par rapport à l'horizontal
-                # Le grand axe est celui de max(ell_w, ell_h)
+                major_len = float(max(ell_w, ell_h))
+                minor_len = float(max(min(ell_w, ell_h), 1e-12))
+                ell_ratio = major_len / minor_len
+
+                # ell_angle est l'angle du premier axe (ell_w) par rapport à l'horizontal.
                 if ell_w < ell_h:
-                    # Le grand axe est le second → ajouter 90°
                     axis_rad = np.radians(ell_angle + 90)
                 else:
                     axis_rad = np.radians(ell_angle)
-                return (float(np.cos(axis_rad)), float(np.sin(axis_rad)))
+                ell_axis = np.array([np.cos(axis_rad), np.sin(axis_rad)], dtype=np.float64)
             except cv2.error:
                 pass
-        
-        # Repli: minAreaRect
+
+        # Forme quasi-circulaire: axe mal défini, mieux vaut ignorer.
+        if ell_axis is not None and pca_axis is not None:
+            if ell_ratio < 1.10 and pca_ratio < 1.10:
+                return None
+
+            # Aligner les signes puis fusion pondérée (ellipse favorisée si anisotropie forte).
+            if np.dot(ell_axis, pca_axis) < 0:
+                pca_axis = -pca_axis
+            w_ell = float(np.clip((ell_ratio - 1.0) / 1.2, 0.0, 1.0))
+            axis = w_ell * ell_axis + (1.0 - w_ell) * pca_axis
+            n = np.linalg.norm(axis)
+            if n > 1e-9:
+                axis = axis / n
+                return (float(axis[0]), float(axis[1]))
+
+        if ell_axis is not None:
+            if ell_ratio < 1.08:
+                return None
+            return (float(ell_axis[0]), float(ell_axis[1]))
+
+        if pca_axis is not None:
+            if pca_ratio < 1.08:
+                return None
+            return (float(pca_axis[0]), float(pca_axis[1]))
+
+        # Dernier repli: minAreaRect si tout le reste a échoué
         try:
             rect = cv2.minAreaRect(contour)
             (_, _), (rw, rh), rangle = rect
-            if rw > rh:
-                axis_rad = np.radians(rangle)
-            else:
-                axis_rad = np.radians(rangle + 90)
+            axis_rad = np.radians(rangle if rw > rh else (rangle + 90))
             return (float(np.cos(axis_rad)), float(np.sin(axis_rad)))
         except cv2.error:
             return None
@@ -1239,8 +1287,8 @@ class WheatSpikeAnalyzerOBB:
            voisinage du centre de l'épillet (rayon = max_attach_ratio ×
            longueur de l'épillet). Cela évite les intersections aberrantes
            avec des portions éloignées du rachis.
-        3. Le point d'attache exact est la projection orthogonale du point
-           rachis candidat sur la droite de l'axe.
+          3. Le point d'attache exact est raffiné directement sur les segments
+              de la polyligne du rachis (et reste donc sur le rachis).
         4. Tangente du rachis = PCA locale sur le squelette au point
            d'intersection.
         5. Angle d'insertion = angle entre la tangente et l'axe (0–90°).
@@ -1261,11 +1309,11 @@ class WheatSpikeAnalyzerOBB:
         if skeleton_pts is None or len(skeleton_pts) < 5:
             return []
         
-        # Ordonner le squelette le long du rachis (par arc-length)
-        skel = self._order_skeleton_by_path(skeleton_pts.astype(np.float64))
-        
+        # Utiliser le rachis brut, uniquement lissé (sans réordonnancement).
+        skel_raw = skeleton_pts.astype(np.float64)
+
         # Lisser le squelette avec une spline pour une tangente robuste
-        skel_smooth = self._smooth_skeleton(skel, n_out=max(200, len(skel)))
+        skel_smooth = self._smooth_skeleton(skel_raw, n_out=max(200, len(skel_raw)))
         
         angle_results = []
         
@@ -1273,6 +1321,7 @@ class WheatSpikeAnalyzerOBB:
             angle_info = {
                 'spikelet_id': sp.get('id'),
                 'attachment_point': None,
+                'spikelet_base_point': None,
                 'insertion_angle_deg': None,
                 'rachis_tangent': None,
                 'spikelet_direction': None,
@@ -1302,10 +1351,9 @@ class WheatSpikeAnalyzerOBB:
             # =================================================================
             # 2. Intersection axe épillet × rachis (recherche locale)
             #
-            #    Droite de l'axe : P(t) = center + t * spikelet_axis
-            #    On cherche le point du squelette le plus proche de cette
-            #    droite, mais UNIQUEMENT parmi les points du rachis dans
-            #    un rayon raisonnable autour du centre de l'épillet.
+            #    On localise d'abord une zone candidate sur le squelette,
+            #    puis on raffine sur les segments de la polyligne pour obtenir
+            #    un point d'attache qui reste sur le rachis.
             # =================================================================
             d = spikelet_axis  # vecteur unitaire
             
@@ -1327,39 +1375,84 @@ class WheatSpikeAnalyzerOBB:
             
             if candidates_mask.any():
                 # Parmi les candidats proches, prendre celui le plus
-                # proche de la droite de l'axe (= meilleure intersection)
-                score = np.where(candidates_mask, dist_to_line, np.inf)
+                # proche de la droite et pas trop éloigné du centre.
+                score = np.where(
+                    candidates_mask,
+                    dist_to_line + 0.08 * dist_to_center,
+                    np.inf,
+                )
                 skel_proj_idx = int(score.argmin())
             else:
                 # Fallback : point du rachis le plus proche du centre
                 skel_proj_idx = int(dist_to_center.argmin())
-            
-            rachis_pt = skel_smooth[skel_proj_idx]
-            
-            # =================================================================
-            # 3. Point d'attache = projection du point rachis sur l'axe
-            #
-            #    Le point exact d'intersection est la projection orthogonale
-            #    du point rachis sur la droite. On vérifie que ce point
-            #    reste à distance raisonnable du centre de l'épillet.
-            # =================================================================
-            t_intersect = t_proj[skel_proj_idx]
-            proj_on_axis = center + t_intersect * d
-            
-            # Distance entre la projection sur l'axe et le point rachis
-            proj_error = float(np.linalg.norm(proj_on_axis - rachis_pt))
-            proj_dist_from_center = abs(t_intersect)
-            
-            # Si la projection est cohérente (pas trop loin du rachis ni
-            # du centre), l'utiliser. Sinon, garder le point rachis.
-            max_proj_error = max(50.0, sp_length * 0.4) if sp_length > 0 else 60.0
-            
-            if proj_error < max_proj_error and proj_dist_from_center < search_radius:
-                attach_pt = proj_on_axis
+
+            # Candidat axe principal x rachis.
+            local_half = max(8, min(80, int(search_radius * 0.35)))
+            attach_pt, attach_idx, attach_line_dist = self._closest_point_on_polyline_to_axis(
+                polyline=skel_smooth,
+                axis_point=center,
+                axis_dir=d,
+                idx_center=skel_proj_idx,
+                half_window=local_half,
+            )
+
+            if attach_pt is None or attach_idx is None:
+                attach_pt = skel_smooth[skel_proj_idx]
+                attach_idx = skel_proj_idx
+                attach_line_dist = float(dist_to_line[skel_proj_idx])
+
+            # Rejeter les cas où l'axe de l'épillet est trop éloigné du rachis.
+            max_line_gap = max(25.0, sp_length * 0.35) if sp_length > 0 else 40.0
+            if attach_line_dist > max_line_gap:
+                angle_results.append(angle_info)
+                continue
+
+            # Filtre demandé: si le point axe↔rachis est trop loin de la bbox
+            # de l'épillet (le long de cet axe), ignorer ce calcul.
+            bbox = sp.get('bbox_global')
+            if bbox is not None and len(bbox) == 4:
+                x1, y1, x2, y2 = [float(v) for v in bbox]
+                bbox_poly = np.array([
+                    [x1, y1],
+                    [x2, y1],
+                    [x2, y2],
+                    [x1, y2],
+                ], dtype=np.float64)
             else:
-                attach_pt = rachis_pt
+                rect = cv2.minAreaRect(contour)
+                bbox_poly = cv2.boxPoints(rect).astype(np.float64)
+
+            poly = bbox_poly.astype(np.float32).reshape(-1, 1, 2)
+            signed_bbox_dist = float(cv2.pointPolygonTest(
+                poly, (float(attach_pt[0]), float(attach_pt[1])), True
+            ))
+            outside_dist = max(0.0, -signed_bbox_dist)
+            ins_cfg = self.config.get('rachis_detection', {}).get('insertion_angle_filter', {})
+            base_outside_px = float(ins_cfg.get('max_outside_bbox_px', 28.0))
+            outside_ratio = float(ins_cfg.get('max_outside_bbox_ratio', 0.55))
+            max_bbox_outside = (
+                max(base_outside_px, sp_length * outside_ratio)
+                if sp_length > 0 else base_outside_px
+            )
+            if outside_dist > max_bbox_outside:
+                angle_results.append(angle_info)
+                continue
+
+            skel_proj_idx = attach_idx
             
             angle_info['attachment_point'] = (int(round(attach_pt[0])), int(round(attach_pt[1])))
+
+            # Base de l'épillet: point du contour le plus proche du rachis.
+            cnt_pts = contour.reshape(-1, 2).astype(np.float64)
+            if len(cnt_pts) > 0:
+                base_idx = int(np.linalg.norm(cnt_pts - attach_pt, axis=1).argmin())
+                base_pt = cnt_pts[base_idx]
+                angle_info['spikelet_base_point'] = (
+                    int(round(base_pt[0])),
+                    int(round(base_pt[1])),
+                )
+            else:
+                base_pt = attach_pt
             
             # =================================================================
             # 4. Tangente locale du rachis (PCA sur fenêtre)
@@ -1388,7 +1481,9 @@ class WheatSpikeAnalyzerOBB:
             # =================================================================
             # 5. Orienter l'axe épillet vers l'extérieur (du rachis)
             # =================================================================
-            outward_vec = center - rachis_pt
+            outward_vec = center - base_pt
+            if np.linalg.norm(outward_vec) < 1e-6:
+                outward_vec = center - attach_pt
             if np.dot(spikelet_axis, outward_vec) < 0:
                 spikelet_axis = -spikelet_axis
             
@@ -1485,7 +1580,68 @@ class WheatSpikeAnalyzerOBB:
             return np.column_stack([x_new, y_new])
         except Exception:
             return pts
-    
+
+    @staticmethod
+    def _closest_point_on_polyline_to_axis(
+        polyline: np.ndarray,
+        axis_point: np.ndarray,
+        axis_dir: np.ndarray,
+        idx_center: int,
+        half_window: int = 25,
+    ) -> Tuple[Optional[np.ndarray], Optional[int], float]:
+        """Trouve le point de polyligne le plus proche d'une droite d'axe."""
+        if polyline is None or len(polyline) < 2:
+            return None, None, float('inf')
+
+        d = np.asarray(axis_dir, dtype=np.float64)
+        d_norm = np.linalg.norm(d)
+        if d_norm < 1e-9:
+            return None, None, float('inf')
+        d = d / d_norm
+
+        n = len(polyline)
+        i0 = max(0, int(idx_center) - int(half_window))
+        i1 = min(n - 2, int(idx_center) + int(half_window))
+        if i1 < i0:
+            return None, None, float('inf')
+
+        best_point = None
+        best_idx = None
+        best_dist = float('inf')
+        best_score = float('inf')
+
+        for i in range(i0, i1 + 1):
+            a = polyline[i].astype(np.float64)
+            b = polyline[i + 1].astype(np.float64)
+            e = b - a
+            w0 = a - axis_point
+
+            # Minimiser la distance à la droite directement sur le segment.
+            w0_perp = w0 - np.dot(w0, d) * d
+            e_perp = e - np.dot(e, d) * d
+            denom = float(np.dot(e_perp, e_perp))
+            if denom > 1e-12:
+                u = -float(np.dot(w0_perp, e_perp)) / denom
+            else:
+                u = 0.0
+            u = float(np.clip(u, 0.0, 1.0))
+
+            p = a + u * e
+            wp = p - axis_point
+            t = float(np.dot(wp, d))
+            perp = wp - t * d
+            dist = float(np.linalg.norm(perp))
+
+            # Pénaliser légèrement les points très éloignés du centre le long de l'axe.
+            score = dist + 0.08 * abs(t)
+            if score < best_score:
+                best_score = score
+                best_dist = dist
+                best_point = p
+                best_idx = i if u < 0.5 else (i + 1)
+
+        return best_point, best_idx, best_dist
+
     # =========================================================================
     # ÉTAPE 1: DÉTECTION YOLO OBB
     # =========================================================================
@@ -3684,9 +3840,13 @@ class WheatSpikeAnalyzerOBB:
             # Dessiner la ligne centrale (skeleton)
             skeleton_pts = rachis.get('skeleton_pts_global')
             if skeleton_pts is not None and len(skeleton_pts) > 1:
-                # Sous-échantillonner pour un tracé plus propre
-                step = max(1, len(skeleton_pts) // 200)
-                pts_draw = skeleton_pts[::step]
+                # Utiliser le rachis brut lissé, comme dans le calcul des angles.
+                pts_draw = self._smooth_skeleton(
+                    skeleton_pts.astype(np.float64),
+                    n_out=max(200, len(skeleton_pts)),
+                )
+                step = max(1, len(pts_draw) // 220)
+                pts_draw = pts_draw[::step]
                 for j in range(len(pts_draw) - 1):
                     pt1 = tuple(pts_draw[j].astype(int))
                     pt2 = tuple(pts_draw[j + 1].astype(int))
@@ -3757,8 +3917,13 @@ class WheatSpikeAnalyzerOBB:
             if rachis is not None:
                 skeleton_pts = rachis.get('skeleton_pts_global')
                 if skeleton_pts is not None and len(skeleton_pts) > 1:
-                    step = max(1, len(skeleton_pts) // 200)
-                    pts_draw = skeleton_pts[::step]
+                    # Même géométrie que pour le calcul des angles.
+                    pts_draw = self._smooth_skeleton(
+                        skeleton_pts.astype(np.float64),
+                        n_out=max(200, len(skeleton_pts)),
+                    )
+                    step = max(1, len(pts_draw) // 220)
+                    pts_draw = pts_draw[::step]
                     for j in range(len(pts_draw) - 1):
                         pt1 = tuple(pts_draw[j].astype(int))
                         pt2 = tuple(pts_draw[j + 1].astype(int))
@@ -3781,6 +3946,12 @@ class WheatSpikeAnalyzerOBB:
                 # Point de rattachement (cercle jaune)
                 cv2.circle(viz, tuple(attach), 6, (0, 255, 255), -1)
                 cv2.circle(viz, tuple(attach), 6, (0, 0, 0), 1)
+
+                # Base de l'épillet côté rachis (violet)
+                base_pt = angle_info.get('spikelet_base_point')
+                if base_pt is not None:
+                    cv2.circle(viz, tuple(base_pt), 4, (255, 0, 255), -1)
+                    cv2.line(viz, tuple(attach), tuple(base_pt), (255, 0, 255), 1)
                 
                 # Ligne vers le centre de l'épillet (cyan)
                 sp_center = (int(sp.get('center_x', 0)), int(sp.get('center_y', 0)))
@@ -3924,8 +4095,12 @@ class WheatSpikeAnalyzerOBB:
                 # Squelette du rachis (rouge)
                 skeleton_pts = rachis.get('skeleton_pts_global')
                 if skeleton_pts is not None and len(skeleton_pts) > 1:
-                    step = max(1, len(skeleton_pts) // 200)
-                    pts_draw = skeleton_pts[::step]
+                    pts_draw = self._smooth_skeleton(
+                        skeleton_pts.astype(np.float64),
+                        n_out=max(200, len(skeleton_pts)),
+                    )
+                    step = max(1, len(pts_draw) // 220)
+                    pts_draw = pts_draw[::step]
                     for j in range(len(pts_draw) - 1):
                         pt1 = tuple(pts_draw[j].astype(int))
                         pt2 = tuple(pts_draw[j + 1].astype(int))
@@ -3943,6 +4118,10 @@ class WheatSpikeAnalyzerOBB:
                 cv2.line(viz, tuple(attach), sp_center, (255, 150, 0), 2)
                 # Point de rattachement (jaune)
                 cv2.circle(viz, tuple(attach), 4, (0, 255, 255), -1)
+                # Base de l'épillet côté rachis (violet)
+                base_pt = angle_info.get('spikelet_base_point')
+                if base_pt is not None:
+                    cv2.circle(viz, tuple(base_pt), 3, (255, 0, 255), -1)
                 # Angle (petit texte)
                 angle_deg = angle_info.get('insertion_angle_deg')
                 if angle_deg is not None:
