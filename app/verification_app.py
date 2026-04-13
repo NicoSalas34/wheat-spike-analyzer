@@ -2144,71 +2144,81 @@ def api_export():
 
 @app.route('/api/regenerate-csv', methods=['POST'])
 def api_regenerate_csv():
-    """Régénère le fichier results_summarised.csv complet avec les corrections"""
+    """Régénère results_summary.csv avec schéma complet + colonnes de vérification."""
     try:
         results = load_all_results()
-        
-        # Chemin du CSV de sortie
-        csv_path = Path(RESULTS_DIR) / 'results_summarised.csv'
-        
-        # D'abord, trouver le nombre maximum de tags
-        max_tags = 0
+
+        # Écrire le CSV standard (même nom que le pipeline batch)
+        csv_path = Path(RESULTS_DIR) / 'results_summary.csv'
+
+        # Nombre max de tags pour générer tag_1...tag_n
+        max_tags = 1
         for result in results:
-            verification = result.get('_verification', {})
-            corrections = result.get('_corrections', {})
-            tags = verification.get('tags', corrections.get('tags', []))
+            ver = result.get('_verification', {}) or {}
+            cor = result.get('_corrections', {}) or {}
+            tags = ver.get('tags', cor.get('tags', [])) or []
             max_tags = max(max_tags, len(tags))
-        
-        # Minimum 1 colonne tag même si pas de tags
-        max_tags = max(max_tags, 1)
-        
+
         rows = []
         for result in results:
-            verification = result.get('_verification', {})
-            corrections = result.get('_corrections', {})
-            bag = result.get('bag', {})
-            cal = result.get('calibration', {})
-            
-            # Utiliser les valeurs corrigées si disponibles
-            sample_id = bag.get('sample_id_corrected') or bag.get('sample_id', '')
-            
-            # Récupérer les tags
-            tags = verification.get('tags', corrections.get('tags', []))
-            
-            # Base row pour l'image (comme dans analyzer_obb.py)
+            ver = result.get('_verification', {}) or {}
+            cor = result.get('_corrections', {}) or {}
+            bag = result.get('bag', {}) or {}
+            cal = result.get('calibration', {}) or {}
+
+            sample_id_original = bag.get('sample_id', '')
+            sample_id_corrected = bag.get('sample_id_corrected', '')
+            sample_id = sample_id_corrected or sample_id_original
+
+            # Si sample_id corrigé est au format bac-ligne-colonne,
+            # on l'utilise pour refléter les modifications dans le CSV.
+            bac = bag.get('bac', '')
+            ligne = bag.get('ligne', '')
+            colonne = bag.get('colonne', '')
+            if sample_id_corrected and '-' in sample_id_corrected:
+                parts = [p.strip() for p in sample_id_corrected.split('-', 2)]
+                if len(parts) == 3:
+                    bac, ligne, colonne = parts
+
+            tags = ver.get('tags', cor.get('tags', [])) or []
+
+            image_path = result.get('image', '')
             base_info = {
-                'image_id': Path(result.get('image', '')).stem,
-                'image_path': result.get('image', ''),
+                'image_id': Path(image_path).stem,
+                'image_path': image_path,
                 'image_width': result.get('image_size', {}).get('width', ''),
                 'image_height': result.get('image_size', {}).get('height', ''),
                 'pixel_per_mm': cal.get('pixel_per_mm', ''),
                 'ruler_detected': cal.get('ruler_detected', False),
                 'ruler_length_px': cal.get('ruler_length_px', ''),
-                'spike_count': len(result.get('spikes', [])),
+                'spike_count': result.get('spike_count', len(result.get('spikes', []))),
                 # Sachet
                 'bag_detected': bag.get('detected', False),
                 'sample_id': sample_id,
-                'bac': bag.get('bac', ''),
-                'ligne': bag.get('ligne', ''),
-                'colonne': bag.get('colonne', ''),
+                'sample_id_original': sample_id_original,
+                'sample_id_corrected': sample_id_corrected,
+                'bac': bac,
+                'ligne': ligne,
+                'colonne': colonne,
                 'bag_confidence': bag.get('confidence', ''),
                 'bag_complete': bag.get('complete', ''),
                 # Vérification
-                'verification_status': verification.get('status', corrections.get('status', 'pending')),
-                'verification_notes': verification.get('notes', corrections.get('notes', '')),
+                'verification_status': ver.get('status', cor.get('status', 'pending')),
+                'verification_notes': ver.get('notes', cor.get('notes', '')),
+                'tags': ';'.join(tags),
             }
-            
+
             # Ajouter les colonnes de tags individuelles
             for i in range(max_tags):
                 base_info[f'tag_{i+1}'] = tags[i] if i < len(tags) else ''
-            
+
             # Ajouter une ligne par épi
             spikes = result.get('spikes', [])
             if spikes:
                 for i, spike in enumerate(spikes):
-                    m = spike.get('measurements', {})
-                    corr = spike.get('corrections', {})
-                    
+                    m = spike.get('measurements', {}) or {}
+                    corr = spike.get('corrections', {}) or {}
+
                     row = base_info.copy()
                     row.update({
                         'spike_id': spike.get('id', i+1),
@@ -2235,11 +2245,88 @@ def api_regenerate_csv():
                         'spikelet_count': corr.get('spikelets') or spike.get('spikelet_count', ''),
                         'spikelet_method': spike.get('spikelet_method', ''),
                         'spikelet_confidence': spike.get('spikelet_confidence', ''),
+                        'spikelet_density_per_cm': spike.get('spikelet_density_per_cm', ''),
+                        'has_segmentation': spike.get('has_segmentation', False),
                         # Coordonnées
                         'center_x': m.get('center_x', ''),
                         'center_y': m.get('center_y', ''),
                         'confidence': m.get('confidence', spike.get('confidence', '')),
                     })
+
+                    # Métriques segmentation épi
+                    seg_metrics = spike.get('segmentation_metrics') or {}
+                    row.update({
+                        'real_area_px': seg_metrics.get('real_area_px', ''),
+                        'real_area_mm2': seg_metrics.get('real_area_mm2', ''),
+                        'real_perimeter_px': seg_metrics.get('real_perimeter_px', ''),
+                        'real_perimeter_mm': seg_metrics.get('real_perimeter_mm', ''),
+                        'circularity': seg_metrics.get('circularity', ''),
+                        'solidity': seg_metrics.get('solidity', ''),
+                        'ellipse_eccentricity': seg_metrics.get('ellipse_eccentricity', ''),
+                        'seg_length_px': seg_metrics.get('seg_length_px', ''),
+                        'seg_length_mm': seg_metrics.get('seg_length_mm', ''),
+                        'seg_width_px': seg_metrics.get('seg_width_px', ''),
+                        'seg_width_mm': seg_metrics.get('seg_width_mm', ''),
+                        'seg_aspect_ratio': seg_metrics.get('seg_aspect_ratio', ''),
+                    })
+
+                    # Profil de largeur
+                    wp = spike.get('width_profile') or {}
+                    row.update({
+                        'shape_class': wp.get('shape_class', ''),
+                        'apical_width_mm': wp.get('apical_width_mm', ''),
+                        'medial_width_mm': wp.get('medial_width_mm', ''),
+                        'basal_width_mm': wp.get('basal_width_mm', ''),
+                        'max_width_mm': wp.get('max_width_mm', ''),
+                        'max_width_position': wp.get('max_width_position', ''),
+                    })
+
+                    # Couleur
+                    col = spike.get('color') or {}
+                    row.update({
+                        'hue_mean': col.get('hue_mean', ''),
+                        'saturation_mean': col.get('saturation_mean', ''),
+                        'value_mean': col.get('value_mean', ''),
+                        'greenness_index': col.get('greenness_index', ''),
+                        'yellowing_index': col.get('yellowing_index', ''),
+                    })
+
+                    # Statistiques épillets segmentés
+                    sp_stats = spike.get('spikelet_stats') or {}
+                    row.update({
+                        'spikelet_seg_count': sp_stats.get('n_segmented', ''),
+                        'spikelet_length_mm_mean': sp_stats.get('spikelet_length_mm_mean', ''),
+                        'spikelet_length_mm_std': sp_stats.get('spikelet_length_mm_std', ''),
+                        'spikelet_width_mm_mean': sp_stats.get('spikelet_width_mm_mean', ''),
+                        'spikelet_width_mm_std': sp_stats.get('spikelet_width_mm_std', ''),
+                        'spikelet_area_mm2_mean': sp_stats.get('spikelet_area_mm2_mean', ''),
+                        'spikelet_area_mm2_std': sp_stats.get('spikelet_area_mm2_std', ''),
+                        'spikelet_aspect_ratio_mean': sp_stats.get('spikelet_aspect_ratio_mean', ''),
+                        'spikelet_circularity_mean': sp_stats.get('spikelet_circularity_mean', ''),
+                        'spikelet_length_cv': sp_stats.get('spikelet_length_cv', ''),
+                        'spikelet_area_cv': sp_stats.get('spikelet_area_cv', ''),
+                    })
+
+                    # Rachis
+                    rachis_data = spike.get('rachis') or {}
+                    row.update({
+                        'rachis_detected': rachis_data.get('detected', False),
+                        'rachis_confidence': rachis_data.get('confidence', ''),
+                        'rachis_length_px': rachis_data.get('length_px', ''),
+                        'rachis_length_mm': rachis_data.get('length_mm', ''),
+                    })
+
+                    # Angles d'insertion
+                    angle_stats = spike.get('insertion_angle_stats') or {}
+                    row.update({
+                        'insertion_angle_mean': angle_stats.get('mean', ''),
+                        'insertion_angle_std': angle_stats.get('std', ''),
+                        'insertion_angle_min': angle_stats.get('min', ''),
+                        'insertion_angle_max': angle_stats.get('max', ''),
+                        'spikelets_left': angle_stats.get('spikelets_left', ''),
+                        'spikelets_right': angle_stats.get('spikelets_right', ''),
+                    })
+
                     rows.append(row)
             else:
                 # Image sans épi détecté
@@ -2264,43 +2351,109 @@ def api_regenerate_csv():
                     'spikelet_count': '',
                     'spikelet_method': '',
                     'spikelet_confidence': '',
+                    'spikelet_density_per_cm': '',
+                    'has_segmentation': '',
+                    'real_area_px': '',
+                    'real_area_mm2': '',
+                    'real_perimeter_px': '',
+                    'real_perimeter_mm': '',
+                    'circularity': '',
+                    'solidity': '',
+                    'ellipse_eccentricity': '',
+                    'seg_length_px': '',
+                    'seg_length_mm': '',
+                    'seg_width_px': '',
+                    'seg_width_mm': '',
+                    'seg_aspect_ratio': '',
+                    'shape_class': '',
+                    'apical_width_mm': '',
+                    'medial_width_mm': '',
+                    'basal_width_mm': '',
+                    'max_width_mm': '',
+                    'max_width_position': '',
+                    'hue_mean': '',
+                    'saturation_mean': '',
+                    'value_mean': '',
+                    'greenness_index': '',
+                    'yellowing_index': '',
+                    'spikelet_seg_count': '',
+                    'spikelet_length_mm_mean': '',
+                    'spikelet_length_mm_std': '',
+                    'spikelet_width_mm_mean': '',
+                    'spikelet_width_mm_std': '',
+                    'spikelet_area_mm2_mean': '',
+                    'spikelet_area_mm2_std': '',
+                    'spikelet_aspect_ratio_mean': '',
+                    'spikelet_circularity_mean': '',
+                    'spikelet_length_cv': '',
+                    'spikelet_area_cv': '',
+                    'rachis_detected': '',
+                    'rachis_confidence': '',
+                    'rachis_length_px': '',
+                    'rachis_length_mm': '',
+                    'insertion_angle_mean': '',
+                    'insertion_angle_std': '',
+                    'insertion_angle_min': '',
+                    'insertion_angle_max': '',
+                    'spikelets_left': '',
+                    'spikelets_right': '',
                     'center_x': '',
                     'center_y': '',
                     'confidence': '',
                 })
                 rows.append(row)
-        
-        # Définir l'ordre des colonnes explicitement (comme analyzer_obb.py)
+
+        # Définir l'ordre des colonnes explicitement (base analyzer + vérification)
         if rows:
-            # Colonnes de base dans l'ordre souhaité
             base_columns = [
                 'image_id', 'image_path', 'image_width', 'image_height',
                 'pixel_per_mm', 'ruler_detected', 'ruler_length_px', 'spike_count',
-                'bag_detected', 'sample_id', 'bac', 'ligne', 'colonne', 'bag_confidence', 'bag_complete',
-                'verification_status', 'verification_notes'
+                'bag_detected', 'sample_id', 'sample_id_original', 'sample_id_corrected',
+                'bac', 'ligne', 'colonne', 'bag_confidence', 'bag_complete',
+                'verification_status', 'verification_notes', 'tags'
             ]
-            # Colonnes de tags
             tag_columns = [f'tag_{i+1}' for i in range(max_tags)]
-            # Colonnes d'épis
             spike_columns = [
                 'spike_id', 'spike_length_px', 'spike_length_mm', 'spike_width_px', 'spike_width_mm',
                 'whole_spike_length_px', 'whole_spike_length_mm', 'awns_length_px', 'awns_length_mm', 'has_awns',
                 'area_px', 'area_mm2', 'perimeter_px', 'perimeter_mm', 'aspect_ratio', 'angle_degrees',
-                'spikelet_count', 'spikelet_method', 'spikelet_confidence',
-                'center_x', 'center_y', 'confidence'
+                'spikelet_count', 'spikelet_method', 'spikelet_confidence', 'spikelet_density_per_cm',
+                'has_segmentation', 'real_area_px', 'real_area_mm2', 'real_perimeter_px', 'real_perimeter_mm',
+                'circularity', 'solidity', 'ellipse_eccentricity',
+                'seg_length_px', 'seg_length_mm', 'seg_width_px', 'seg_width_mm', 'seg_aspect_ratio',
+                'shape_class', 'apical_width_mm', 'medial_width_mm', 'basal_width_mm', 'max_width_mm',
+                'max_width_position',
+                'hue_mean', 'saturation_mean', 'value_mean', 'greenness_index', 'yellowing_index',
+                'center_x', 'center_y', 'confidence',
+                'spikelet_seg_count', 'spikelet_length_mm_mean', 'spikelet_length_mm_std',
+                'spikelet_width_mm_mean', 'spikelet_width_mm_std', 'spikelet_area_mm2_mean',
+                'spikelet_area_mm2_std', 'spikelet_aspect_ratio_mean', 'spikelet_circularity_mean',
+                'spikelet_length_cv', 'spikelet_area_cv',
+                'rachis_detected', 'rachis_confidence', 'rachis_length_px', 'rachis_length_mm',
+                'insertion_angle_mean', 'insertion_angle_std', 'insertion_angle_min', 'insertion_angle_max',
+                'spikelets_left', 'spikelets_right'
             ]
-            fieldnames = base_columns + tag_columns + spike_columns
-            
-            with open(csv_path, 'w', newline='') as f:
+
+            # Fusionner avec tout champ additionnel éventuel pour compatibilité future
+            all_fieldnames = set()
+            for row in rows:
+                all_fieldnames.update(row.keys())
+
+            fieldnames = [f for f in (base_columns + tag_columns + spike_columns) if f in all_fieldnames]
+            fieldnames += [f for f in sorted(all_fieldnames) if f not in fieldnames]
+
+            with open(csv_path, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 writer.writeheader()
                 writer.writerows(rows)
-            
-            logger.info(f"CSV régénéré: {csv_path} ({len(rows)} lignes, {max_tags} colonnes tags)")
-            return jsonify({'success': True, 'count': len(rows), 'path': str(csv_path)})
+
+            logger.info(
+                f"CSV régénéré: {csv_path} ({len(rows)} lignes, {len(fieldnames)} colonnes, {max_tags} tags max)"
+            )
+            return jsonify({'success': True, 'count': len(rows), 'path': str(csv_path), 'columns': len(fieldnames)})
         else:
             return jsonify({'success': False, 'error': 'Aucun résultat à exporter'})
-            
+
     except Exception as e:
         logger.error(f"Erreur régénération CSV: {e}")
         return jsonify({'success': False, 'error': str(e)})

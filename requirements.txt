@@ -14,10 +14,17 @@ albumentations>=2.0.0
 
 # Scientific computing
 scipy>=1.12.0
+scikit-learn>=1.5.0
 
 # Data processing
 pandas>=2.2.0
 PyYAML>=6.0
+seaborn>=0.13.0
+plotly>=5.22.0
+
+# Statistical genetics (optional, proprietary beta package)
+# Install according to VSN ASReml-Python beta instructions
+# asreml
 
 # Utilities
 tqdm>=4.66.0
