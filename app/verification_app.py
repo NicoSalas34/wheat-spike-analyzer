@@ -33,6 +33,7 @@ import csv
 import json
 import logging
 import os
+import shutil
 from datetime import datetime
 from io import StringIO
 from pathlib import Path
@@ -70,8 +71,12 @@ def load_all_results() -> List[Dict]:
     
     results = []
     results_dir = Path(RESULTS_DIR)
+
+    if not results_dir.exists():
+        RESULTS_CACHE = {}
+        return results
     
-    for results_file in sorted(results_dir.glob('**/results.json')):
+    for source_index, results_file in enumerate(sorted(results_dir.glob('**/results.json'))):
         try:
             with open(results_file, 'r') as f:
                 data = json.load(f)
@@ -80,6 +85,7 @@ def load_all_results() -> List[Dict]:
             session_dir = results_file.parent
             data['_session_dir'] = str(session_dir)
             data['_results_file'] = str(results_file)
+            data['_source_index'] = source_index
             
             # Charger la vérification existante si présente
             if '_verification' in data:
@@ -154,6 +160,430 @@ def save_correction(image_id: str, corrections: Dict) -> bool:
     except Exception as e:
         logger.error(f"Erreur sauvegarde {results_file}: {e}")
         return False
+
+
+def _normalize_csv_value(value) -> str:
+    """Normalize a CSV field value to a trimmed string."""
+    if value is None:
+        return ''
+    return str(value).strip()
+
+
+def _parse_csv_spike_id(value) -> Optional[int]:
+    """Parse spike_id values from CSV (supports integer-like text such as '1' or '1.0')."""
+    text = _normalize_csv_value(value)
+    if not text:
+        return None
+
+    try:
+        return int(text)
+    except ValueError:
+        try:
+            numeric = float(text.replace(',', '.'))
+        except ValueError:
+            return None
+        if numeric.is_integer():
+            return int(numeric)
+
+    return None
+
+
+def _extract_csv_image_id(row: Dict) -> str:
+    """Extract an image id from a CSV row using common column names."""
+    image_id = _normalize_csv_value(row.get('image_id'))
+    if image_id:
+        return Path(image_id.replace('\\', '/')).stem
+
+    image_name = _normalize_csv_value(row.get('image'))
+    if image_name:
+        return Path(image_name.replace('\\', '/')).stem
+
+    image_path = _normalize_csv_value(row.get('image_path'))
+    if image_path:
+        return Path(image_path.replace('\\', '/')).stem
+
+    return ''
+
+
+def _is_clear_marker(value: str) -> bool:
+    """Return True when a CSV value explicitly asks to clear a field."""
+    return _normalize_csv_value(value).upper() in {'__CLEAR__', '[CLEAR]', 'CLEAR'}
+
+
+def _dedupe_keep_order(values: List[str]) -> List[str]:
+    """Deduplicate strings while preserving insertion order."""
+    unique_values: List[str] = []
+    for value in values:
+        if value not in unique_values:
+            unique_values.append(value)
+    return unique_values
+
+
+def _split_csv_tags(raw_tags: str) -> List[str]:
+    """Split tags from a CSV cell and normalize whitespace."""
+    text = _normalize_csv_value(raw_tags)
+    if not text:
+        return []
+
+    # Prefer ';' (CSV export format), fallback to ',' when needed.
+    separator = ';' if ';' in text else ','
+    parts = [part.strip() for part in text.split(separator)]
+    return _dedupe_keep_order([part for part in parts if part])
+
+
+def _normalize_verification_status(value: str) -> str:
+    """Normalize verification status values read from CSV."""
+    normalized = _normalize_csv_value(value).lower()
+    if not normalized:
+        return ''
+
+    status_map = {
+        'validated': 'validated',
+        'valide': 'validated',
+        'validé': 'validated',
+        'validate': 'validated',
+        'rejected': 'rejected',
+        'rejete': 'rejected',
+        'rejeté': 'rejected',
+        'reject': 'rejected',
+        'pending': 'pending',
+        'awaiting': 'pending',
+        'en attente': 'pending',
+    }
+    return status_map.get(normalized, normalized)
+
+
+def apply_back_modifications_from_csv_content(csv_content: str, dry_run: bool = False) -> Dict:
+    """Apply CSV-based back modifications to results.json files.
+
+    Rules:
+        - sample_id_corrected: if provided in CSV, update bag.sample_id_corrected.
+            To clear it, use an explicit value: __CLEAR__, [CLEAR], or CLEAR.
+        - verification_status: if provided in CSV, update _verification.status.
+        - tags/tag_1..tag_n: if provided in CSV, update _verification.tags.
+        - spikes: for each image, keep only spikes whose `spike_id` still exists in CSV rows.
+            If an image has rows but no numeric spike_id, all spikes are removed.
+    """
+    load_all_results()
+
+    reader = csv.DictReader(StringIO(csv_content))
+    if not reader.fieldnames:
+        raise ValueError('CSV vide ou en-tête introuvable')
+
+    fieldnames = list(reader.fieldnames)
+    fieldnames_set = set(fieldnames)
+    has_sample_col = 'sample_id_corrected' in fieldnames_set
+    has_spike_col = 'spike_id' in fieldnames_set
+    has_status_col = 'verification_status' in fieldnames_set
+    has_tags_col = 'tags' in fieldnames_set
+    tag_columns = [field for field in fieldnames if field.lower().startswith('tag_')]
+    has_split_tag_cols = bool(tag_columns)
+
+    if not any([has_sample_col, has_spike_col, has_status_col, has_tags_col, has_split_tag_cols]):
+        raise ValueError(
+            "Le CSV doit contenir au moins une des colonnes: "
+            "sample_id_corrected, spike_id, verification_status, tags ou tag_*"
+        )
+
+    csv_by_image: Dict[str, Dict] = {}
+    rows_total = 0
+    rows_without_image_id = 0
+
+    for row in reader:
+        rows_total += 1
+        image_id = _extract_csv_image_id(row)
+        if not image_id:
+            rows_without_image_id += 1
+            continue
+
+        entry = csv_by_image.setdefault(
+            image_id,
+            {
+                'sample_values': [],
+                'force_clear_sample': False,
+                'keep_spike_ids': set(),
+                'saw_spike_column': False,
+                'has_numeric_spike_ids': False,
+                'status_values': [],
+                'saw_status_column': False,
+                'tags_values': [],
+                'saw_tags_column': False,
+                'force_clear_tags': False,
+            },
+        )
+
+        if has_sample_col:
+            sample_value = _normalize_csv_value(row.get('sample_id_corrected'))
+            if sample_value:
+                if _is_clear_marker(sample_value):
+                    entry['force_clear_sample'] = True
+                else:
+                    entry['sample_values'].append(sample_value)
+
+        if has_status_col:
+            entry['saw_status_column'] = True
+            status_value = _normalize_csv_value(row.get('verification_status'))
+            if status_value:
+                if _is_clear_marker(status_value):
+                    entry['status_values'].append('pending')
+                else:
+                    normalized_status = _normalize_verification_status(status_value)
+                    if normalized_status:
+                        entry['status_values'].append(normalized_status)
+
+        if has_tags_col or has_split_tag_cols:
+            entry['saw_tags_column'] = True
+            row_tags: List[str] = []
+
+            if has_tags_col:
+                tags_value = _normalize_csv_value(row.get('tags'))
+                if tags_value:
+                    if _is_clear_marker(tags_value):
+                        entry['force_clear_tags'] = True
+                    else:
+                        row_tags.extend(_split_csv_tags(tags_value))
+
+            for tag_column in tag_columns:
+                tag_value = _normalize_csv_value(row.get(tag_column))
+                if not tag_value:
+                    continue
+                if _is_clear_marker(tag_value):
+                    entry['force_clear_tags'] = True
+                    continue
+                row_tags.extend(_split_csv_tags(tag_value))
+
+            if row_tags:
+                entry['tags_values'].extend(row_tags)
+
+        if has_spike_col:
+            entry['saw_spike_column'] = True
+            spike_id = _parse_csv_spike_id(row.get('spike_id'))
+            if spike_id is not None:
+                entry['keep_spike_ids'].add(spike_id)
+                entry['has_numeric_spike_ids'] = True
+
+    summary = {
+        'rows_total': rows_total,
+        'rows_without_image_id': rows_without_image_id,
+        'images_in_csv': len(csv_by_image),
+        'images_found': 0,
+        'images_updated': 0,
+        'sample_id_updated': 0,
+        'sample_id_cleared': 0,
+        'verification_status_updated': 0,
+        'tags_updated': 0,
+        'tags_cleared': 0,
+        'spikes_removed_total': 0,
+        'images_not_found': 0,
+        'images_not_found_examples': [],
+        'sample_id_conflict_count': 0,
+        'sample_id_conflicts': [],
+        'verification_status_conflict_count': 0,
+        'verification_status_conflicts': [],
+        'dry_run': bool(dry_run),
+    }
+
+    missing_images: List[str] = []
+    sample_conflicts: List[Dict] = []
+    status_conflicts: List[Dict] = []
+
+    for image_id, entry in csv_by_image.items():
+        result = RESULTS_CACHE.get(image_id)
+        if result is None:
+            missing_images.append(image_id)
+            continue
+
+        summary['images_found'] += 1
+
+        result_changed = False
+        sample_was_updated = False
+        sample_was_cleared = False
+        status_was_updated = False
+        tags_were_updated = False
+        tags_were_cleared = False
+        spikes_removed_for_image = 0
+
+        bag = result.get('bag')
+        if not isinstance(bag, dict):
+            bag = {}
+            result['bag'] = bag
+
+        verification = result.get('_verification')
+        if not isinstance(verification, dict):
+            verification = {}
+        corrections = result.get('_corrections') or {}
+
+        verification.setdefault('status', corrections.get('status', 'pending'))
+        verification.setdefault('tags', corrections.get('tags', []))
+        verification.setdefault('notes', corrections.get('notes', ''))
+
+        # sample_id_corrected update
+        if has_sample_col:
+            unique_samples = _dedupe_keep_order(entry['sample_values'])
+
+            target_sample = None
+            has_conflict = len(unique_samples) > 1
+
+            if has_conflict:
+                sample_conflicts.append({'image_id': image_id, 'values': unique_samples})
+            elif len(unique_samples) == 1:
+                target_sample = unique_samples[0]
+            elif entry['force_clear_sample']:
+                target_sample = ''
+
+            if target_sample is not None and not has_conflict:
+                current_sample = _normalize_csv_value(bag.get('sample_id_corrected'))
+
+                if target_sample:
+                    if current_sample != target_sample:
+                        bag['sample_id_corrected'] = target_sample
+
+                        parts = [p.strip() for p in target_sample.split('-', 2)]
+                        if len(parts) == 3:
+                            bag['bac'], bag['ligne'], bag['colonne'] = parts
+
+                        sample_was_updated = True
+                        result_changed = True
+                else:
+                    if current_sample:
+                        bag.pop('sample_id_corrected', None)
+                        sample_was_cleared = True
+                        result_changed = True
+
+        # verification_status update
+        if has_status_col and entry['saw_status_column']:
+            unique_statuses = _dedupe_keep_order(entry['status_values'])
+            target_status = None
+            has_conflict = len(unique_statuses) > 1
+
+            if has_conflict:
+                status_conflicts.append({'image_id': image_id, 'values': unique_statuses})
+            elif len(unique_statuses) == 1:
+                target_status = unique_statuses[0]
+            else:
+                target_status = 'pending'
+
+            if target_status is not None and not has_conflict:
+                current_status = _normalize_verification_status(
+                    verification.get('status', corrections.get('status', 'pending'))
+                )
+                if current_status != target_status:
+                    verification['status'] = target_status
+                    status_was_updated = True
+                    result_changed = True
+
+        # tags update from `tags` and/or `tag_*` columns
+        if (has_tags_col or has_split_tag_cols) and entry['saw_tags_column']:
+            if entry['force_clear_tags']:
+                target_tags: List[str] = []
+            else:
+                target_tags = _dedupe_keep_order(entry['tags_values'])
+
+            current_tags_raw = verification.get('tags', corrections.get('tags', []))
+            if isinstance(current_tags_raw, list):
+                current_tags = _dedupe_keep_order([
+                    _normalize_csv_value(tag)
+                    for tag in current_tags_raw
+                    if _normalize_csv_value(tag)
+                ])
+            else:
+                current_tags = _split_csv_tags(_normalize_csv_value(current_tags_raw))
+
+            if current_tags != target_tags:
+                verification['tags'] = target_tags
+                tags_were_updated = True
+                if not target_tags:
+                    tags_were_cleared = True
+                result_changed = True
+
+        # Spike pruning based on remaining spike_id rows in CSV
+        if has_spike_col and entry['saw_spike_column']:
+            spikes = list(result.get('spikes') or [])
+
+            if entry['has_numeric_spike_ids']:
+                keep_ids = entry['keep_spike_ids']
+                filtered_spikes = []
+
+                for idx, spike in enumerate(spikes):
+                    spike_identifier = _parse_csv_spike_id(spike.get('id'))
+                    if spike_identifier is None:
+                        spike_identifier = idx + 1
+
+                    if spike_identifier in keep_ids:
+                        filtered_spikes.append(spike)
+
+                spikes_removed_for_image = len(spikes) - len(filtered_spikes)
+                if spikes_removed_for_image > 0:
+                    result['spikes'] = filtered_spikes
+                    result['spike_count'] = len(filtered_spikes)
+                    result_changed = True
+            else:
+                if spikes:
+                    spikes_removed_for_image = len(spikes)
+                    result['spikes'] = []
+                    result['spike_count'] = 0
+                    result_changed = True
+
+        if not result_changed:
+            continue
+
+        summary['images_updated'] += 1
+        summary['spikes_removed_total'] += spikes_removed_for_image
+        if sample_was_updated:
+            summary['sample_id_updated'] += 1
+        if sample_was_cleared:
+            summary['sample_id_cleared'] += 1
+        if status_was_updated:
+            summary['verification_status_updated'] += 1
+        if tags_were_updated:
+            summary['tags_updated'] += 1
+        if tags_were_cleared:
+            summary['tags_cleared'] += 1
+
+        if status_was_updated or tags_were_updated:
+            verification['verified_at'] = datetime.now().isoformat()
+            verification['verified_by'] = 'verification_app_csv_import'
+
+        # Track bulk operation in verification history
+        history = verification.get('history', []) or []
+        history.append({
+            'action': 'apply_csv_back_modifications',
+            'when': datetime.now().isoformat(),
+            'by': 'verification_app',
+            'spikes_removed': spikes_removed_for_image,
+            'sample_id_corrected': bag.get('sample_id_corrected', ''),
+            'verification_status': verification.get('status', 'pending'),
+            'tags': verification.get('tags', []),
+        })
+        verification['history'] = history
+        result['_verification'] = verification
+
+        if dry_run:
+            continue
+
+        results_file = Path(result['_results_file'])
+        save_data = {k: v for k, v in result.items() if not k.startswith('_') or k == '_verification'}
+        with open(results_file, 'w') as f:
+            json.dump(save_data, f, indent=2, default=str)
+
+        # Refresh corrected overlay if spike list changed
+        if spikes_removed_for_image > 0:
+            try:
+                add_spike_numbers_overlay(str(results_file.parent))
+            except Exception as overlay_error:
+                logger.warning(f"Impossible de régénérer l'image corrigée pour {results_file.parent}: {overlay_error}")
+
+    summary['images_not_found'] = len(missing_images)
+    summary['images_not_found_examples'] = missing_images[:20]
+    summary['sample_id_conflict_count'] = len(sample_conflicts)
+    summary['sample_id_conflicts'] = sample_conflicts[:20]
+    summary['verification_status_conflict_count'] = len(status_conflicts)
+    summary['verification_status_conflicts'] = status_conflicts[:20]
+
+    if not dry_run:
+        load_all_results()
+
+    return summary
 
 
 def get_debug_image_path(session_dir: str, image_type: str = 'final') -> Optional[str]:
@@ -337,6 +767,7 @@ HTML_TEMPLATE = """
             display: flex;
             gap: 15px;
             align-items: center;
+            flex-wrap: wrap;
         }
         
         .counter {
@@ -370,6 +801,14 @@ HTML_TEMPLATE = """
         
         .header-btn.export:hover {
             background: #059669;
+        }
+
+        .header-btn.danger {
+            background: #e94560;
+        }
+
+        .header-btn.danger:hover {
+            background: #d03050;
         }
         
         /* Filter dropdown */
@@ -972,13 +1411,28 @@ HTML_TEMPLATE = """
                         <option value="tag_bag_unreadable">🏷️ Tag: Sachet illisible</option>
                         <option value="tag_spikelets_wrong">🏷️ Tag: Épillets incorrects</option>
                     </optgroup>
+                    <optgroup label="── Échantillons ──">
+                        <option value="duplicate_sample_corrected">🧩 Sample corrigé en doublon</option>
+                    </optgroup>
                 </select>
             </div>
+            <div class="filter-dropdown">
+                <select class="filter-select" id="sortSelect" onchange="applyAdvancedFilter()" title="Mode de tri">
+                    <option value="original">↕ Ordre d'origine</option>
+                    <option value="sample_id_corrected">🧩 Sample ID corrigé</option>
+                </select>
+            </div>
+            <button class="header-btn" onclick="triggerCsvBackImport()">
+                📥 CSV → JSON
+            </button>
             <button class="header-btn export" onclick="regenerateCSV()">
                 📊 Régénérer CSV
             </button>
             <button class="header-btn" onclick="regenerateCurrentImage()">
                 🔁 Régénérer image
+            </button>
+            <button class="header-btn danger" onclick="deleteCurrentSessionDirectory()">
+                🗑️ Supprimer session affichée
             </button>
             <button class="header-btn" onclick="undoLastDelete()">
                 ↶ Annuler suppression
@@ -989,6 +1443,8 @@ HTML_TEMPLATE = """
             </div>
         </div>
     </div>
+
+    <input type="file" id="csvBackImportInput" accept=".csv,text/csv" style="display:none;" onchange="handleCsvBackImport(event)">
     
     <div class="main">
         <!-- Navigation panel -->
@@ -1126,6 +1582,69 @@ HTML_TEMPLATE = """
         let filteredResults = [];
         let currentIndex = 0;
         let currentTags = [];
+
+        function getSourceIndex(result) {
+            return Number.isFinite(result._source_index) ? result._source_index : 0;
+        }
+
+        function compareText(left, right) {
+            const leftValue = (left || '').trim();
+            const rightValue = (right || '').trim();
+
+            if (!leftValue && rightValue) return 1;
+            if (leftValue && !rightValue) return -1;
+
+            return leftValue.localeCompare(rightValue, undefined, { numeric: true, sensitivity: 'base' });
+        }
+
+        function getCorrectedSampleIdSortKey(result) {
+            const bag = result.bag || {};
+            return (bag.sample_id_corrected || '').trim();
+        }
+
+        function getSampleIdSortKey(result) {
+            const bag = result.bag || {};
+            return (bag.sample_id_corrected || bag.sample_id || '').trim();
+        }
+
+        function buildCorrectedSampleIdCounts(items) {
+            const counts = new Map();
+
+            items.forEach((item) => {
+                const key = getCorrectedSampleIdSortKey(item);
+                if (!key) return;
+                counts.set(key, (counts.get(key) || 0) + 1);
+            });
+
+            return counts;
+        }
+
+        function sortFilteredResults(items) {
+            const sortValue = document.getElementById('sortSelect')?.value || 'original';
+            if (sortValue === 'original') {
+                return items;
+            }
+
+            if (sortValue === 'sample_id_corrected') {
+                return [...items].sort((left, right) => {
+                    const keyComparison = compareText(getSampleIdSortKey(left), getSampleIdSortKey(right));
+                    if (keyComparison !== 0) {
+                        return keyComparison;
+                    }
+
+                    return getSourceIndex(left) - getSourceIndex(right);
+                });
+            }
+
+            return [...items].sort((left, right) => {
+                const keyComparison = compareText(getSampleIdSortKey(left), getSampleIdSortKey(right));
+                if (keyComparison !== 0) {
+                    return keyComparison;
+                }
+
+                return getSourceIndex(left) - getSourceIndex(right);
+            });
+        }
         
         // Charger les résultats au démarrage
         async function loadResults() {
@@ -1221,15 +1740,18 @@ HTML_TEMPLATE = """
         }
         
         function applyAdvancedFilter() {
+            const currentImagePath = filteredResults[currentIndex]?.image || null;
             const filterValue = document.getElementById('filterSelect').value;
+            const correctedSampleCounts = buildCorrectedSampleIdCounts(results);
             
-            filteredResults = results.filter(r => {
+            filteredResults = sortFilteredResults(results.filter(r => {
                 const corrections = r._corrections || {};
                 const status = corrections.status || 'pending';
                 const tags = corrections.tags || [];
                 const cal = r.calibration || {};
                 const bag = r.bag || {};
                 const spikes = r.spikes || [];
+                const correctedSampleId = getCorrectedSampleIdSortKey(r);
                 
                 switch(filterValue) {
                     case 'all':
@@ -1271,13 +1793,23 @@ HTML_TEMPLATE = """
                         return tags.includes('bag_unreadable');
                     case 'tag_spikelets_wrong':
                         return tags.includes('spikelets_wrong');
+
+                    // Échantillons
+                    case 'duplicate_sample_corrected':
+                        return !!correctedSampleId && (correctedSampleCounts.get(correctedSampleId) || 0) > 1;
                     
                     default:
                         return true;
                 }
-            });
+            }));
             
-            currentIndex = Math.min(currentIndex, Math.max(0, filteredResults.length - 1));
+            if (currentImagePath) {
+                const newIndex = filteredResults.findIndex(r => r.image === currentImagePath);
+                currentIndex = newIndex >= 0 ? newIndex : Math.min(currentIndex, Math.max(0, filteredResults.length - 1));
+            } else {
+                currentIndex = Math.min(currentIndex, Math.max(0, filteredResults.length - 1));
+            }
+
             if (filteredResults.length > 0) {
                 displayResult(currentIndex);
             } else {
@@ -1302,7 +1834,7 @@ HTML_TEMPLATE = """
         function cycleFilter() {
             // Cycle à travers les filtres principaux avec la touche F
             const select = document.getElementById('filterSelect');
-            const mainFilters = ['all', 'awaiting', 'pending', 'no_ruler', 'no_spikes', 'no_bag'];
+            const mainFilters = ['all', 'awaiting', 'pending', 'duplicate_sample_corrected', 'no_ruler', 'no_spikes', 'no_bag'];
             const currentIdx = mainFilters.indexOf(select.value);
             const nextIdx = (currentIdx + 1) % mainFilters.length;
             select.value = mainFilters[nextIdx];
@@ -1313,6 +1845,7 @@ HTML_TEMPLATE = """
                 'all': 'Tous',
                 'awaiting': 'En attente',
                 'pending': 'Non validés',
+                'duplicate_sample_corrected': 'Samples corrigés en doublon',
                 'no_ruler': 'Sans règle',
                 'no_spikes': 'Sans épis',
                 'no_bag': 'Sans sachet'
@@ -1714,6 +2247,105 @@ HTML_TEMPLATE = """
                     spikeItem.style.transform = 'translateX(0)';
                 }
                 showToast('Erreur réseau', 'error');
+            }
+        }
+
+        function triggerCsvBackImport() {
+            const input = document.getElementById('csvBackImportInput');
+            if (!input) return;
+            input.value = '';
+            input.click();
+        }
+
+        async function handleCsvBackImport(event) {
+            const file = event?.target?.files?.[0];
+            if (!file) return;
+
+            const firstConfirm = confirm(
+                `Appliquer les modifications du CSV "${file.name}" sur tous les results.json correspondants ?`
+            );
+            if (!firstConfirm) {
+                event.target.value = '';
+                return;
+            }
+
+            showLoading(true);
+            try {
+                const formData = new FormData();
+                formData.append('file', file);
+                formData.append('confirm', 'true');
+
+                const response = await fetch('/api/apply_csv_back_modifications', {
+                    method: 'POST',
+                    body: formData,
+                });
+
+                const data = await response.json();
+                if (response.ok && data.success) {
+                    showToast(
+                        `CSV appliqué: ${data.images_updated} images modifiées, ${data.spikes_removed_total} épis supprimés, ${data.verification_status_updated || 0} statuts, ${data.tags_updated || 0} tags`,
+                        'success'
+                    );
+
+                    if (data.sample_id_conflict_count > 0) {
+                        showToast(
+                            `${data.sample_id_conflict_count} conflit(s) sample_id_corrected ignoré(s)`,
+                            'info'
+                        );
+                    }
+
+                    if ((data.verification_status_conflict_count || 0) > 0) {
+                        showToast(
+                            `${data.verification_status_conflict_count} conflit(s) de statut ignoré(s)`,
+                            'info'
+                        );
+                    }
+
+                    await loadResults();
+                } else {
+                    showToast(data.error || "Échec de l'application du CSV", 'error');
+                }
+            } catch (e) {
+                showToast('Erreur réseau', 'error');
+            } finally {
+                showLoading(false);
+                event.target.value = '';
+            }
+        }
+
+        async function deleteCurrentSessionDirectory() {
+            const result = filteredResults[currentIndex];
+            if (!result) return showToast('Aucun résultat sélectionné', 'error');
+
+            const sessionDir = result._session_dir;
+            const fileName = (result.image || '').split('/').pop() || "l'image affichée";
+            if (!sessionDir) return showToast('Session introuvable', 'error');
+
+            const firstConfirm = confirm(`Supprimer le sous-répertoire de ${fileName} ? Cette action est irréversible.`);
+            if (!firstConfirm) return;
+
+            const secondConfirm = confirm(`Confirmer la suppression du dossier:\n${sessionDir}`);
+            if (!secondConfirm) return;
+
+            showLoading(true);
+            try {
+                const response = await fetch('/api/delete_current_session_dir', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({session_dir: sessionDir})
+                });
+
+                const data = await response.json();
+                if (response.ok && data.success) {
+                    showToast('Session supprimée', 'success');
+                    await loadResults();
+                } else {
+                    showToast(data.error || 'Suppression impossible', 'error');
+                }
+            } catch (e) {
+                showToast('Erreur réseau', 'error');
+            } finally {
+                showLoading(false);
             }
         }
 
@@ -2140,6 +2772,96 @@ def api_export():
         mimetype='text/csv',
         headers={'Content-Disposition': 'attachment; filename=corrections_export.csv'}
     )
+
+
+@app.route('/api/apply_csv_back_modifications', methods=['POST'])
+def api_apply_csv_back_modifications():
+    """Applique des rétro-modifications JSON à partir d'un CSV (upload multipart)."""
+    uploaded = request.files.get('file')
+    if uploaded is None:
+        return jsonify({'success': False, 'error': 'Missing CSV file'}), 400
+
+    confirm = _normalize_csv_value(request.form.get('confirm')).lower()
+    if confirm not in {'1', 'true', 'yes', 'oui'}:
+        return jsonify({'success': False, 'error': 'Confirmation required'}), 400
+
+    dry_run = _normalize_csv_value(request.form.get('dry_run')).lower() in {'1', 'true', 'yes', 'oui'}
+
+    try:
+        csv_bytes = uploaded.read()
+        if not csv_bytes:
+            return jsonify({'success': False, 'error': 'CSV file is empty'}), 400
+
+        csv_content = None
+        for encoding in ('utf-8-sig', 'utf-8', 'latin-1'):
+            try:
+                csv_content = csv_bytes.decode(encoding)
+                break
+            except UnicodeDecodeError:
+                continue
+
+        if csv_content is None:
+            return jsonify({'success': False, 'error': 'Unable to decode CSV (expected UTF-8 or latin-1)'}), 400
+
+        summary = apply_back_modifications_from_csv_content(csv_content, dry_run=dry_run)
+        logger.info(
+            "CSV back-modifications applied: "
+            f"updated={summary.get('images_updated', 0)} "
+            f"spikes_removed={summary.get('spikes_removed_total', 0)} "
+            f"sample_updated={summary.get('sample_id_updated', 0)} "
+            f"status_updated={summary.get('verification_status_updated', 0)} "
+            f"tags_updated={summary.get('tags_updated', 0)} "
+            f"sample_cleared={summary.get('sample_id_cleared', 0)} dry_run={dry_run}"
+        )
+
+        return jsonify({'success': True, **summary})
+
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+    except Exception as e:
+        logger.error(f"Erreur application CSV back-modifications: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/delete_current_session_dir', methods=['POST'])
+def api_delete_current_session_dir():
+    """Supprime le sous-répertoire de session correspondant à l'image affichée."""
+    data = request.json or {}
+    session_dir = data.get('session_dir')
+    if not session_dir:
+        return jsonify({'success': False, 'error': 'Missing session_dir'}), 400
+
+    global RESULTS_CACHE
+
+    output_dir = Path(RESULTS_DIR).resolve()
+    session_path = Path(session_dir).resolve()
+
+    if not output_dir.exists():
+        RESULTS_CACHE = {}
+        return jsonify({'success': False, 'error': 'Output directory not found'}), 404
+
+    try:
+        session_path.relative_to(output_dir)
+    except ValueError:
+        return jsonify({'success': False, 'error': 'Session directory must be inside output directory'}), 400
+
+    if session_path == output_dir:
+        return jsonify({'success': False, 'error': 'Refusing to delete output root directory'}), 400
+
+    if not session_path.exists() or not session_path.is_dir():
+        return jsonify({'success': False, 'error': 'Session directory not found'}), 404
+
+    if not (session_path / 'results.json').exists():
+        return jsonify({'success': False, 'error': 'Invalid session directory: results.json missing'}), 400
+
+    try:
+        shutil.rmtree(session_path)
+        RESULTS_CACHE = {}
+        logger.info(f"Sous-répertoire de session supprimé: {session_path}")
+        return jsonify({'success': True, 'deleted': True, 'path': str(session_path)})
+    except Exception as e:
+        logger.error(f"Erreur suppression sous-répertoire session {session_path}: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 
 @app.route('/api/regenerate-csv', methods=['POST'])
