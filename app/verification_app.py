@@ -22,6 +22,13 @@ Tags prédéfinis:
     - Épillets incorrects
     - Image floue
     - Plusieurs épis confondus
+    - Calibration incorrecte
+    - Mauvaise graduation
+    - Sachet absent
+    - Épi sans barbes
+    - Épillets incorrects - pas améliorable
+    - Mauvais angle insertion
+    - Mauvais rachis
 
 Usage:
     python app/verification_app.py --output output/
@@ -62,6 +69,12 @@ PREDEFINED_TAGS = [
     {"id": "blurry", "label": "Image floue", "color": "#60a5fa", "shortcut": "6"},
     {"id": "multiple_spikes", "label": "Plusieurs épis confondus", "color": "#f472b6", "shortcut": "7"},
     {"id": "calibration_wrong", "label": "Calibration incorrecte", "color": "#94a3b8", "shortcut": "8"},
+    {"id": "wrong_graduation", "label": "Mauvaise graduation", "color": "#e879f9", "shortcut": "9"},
+    {"id": "bag_missing", "label": "Sachet absent", "color": "#fcd34d", "shortcut": ""},
+    {"id": "spike_no_awns", "label": "Épi sans barbes", "color": "#34d399", "shortcut": ""},
+    {"id": "spikelets_unimprovable", "label": "Épillets incorrects - pas améliorable", "color": "#c084fc", "shortcut": ""},
+    {"id": "wrong_insertion_angle", "label": "Mauvais angle insertion", "color": "#fb7185", "shortcut": ""},
+    {"id": "wrong_rachis", "label": "Mauvais rachis", "color": "#22d3ee", "shortcut": ""},
 ]
 
 
@@ -2546,7 +2559,7 @@ HTML_TEMPLATE = """
             }
             
             // Raccourcis numériques pour les tags
-            if (e.key >= '1' && e.key <= '8') {
+            if (e.key >= '1' && e.key <= '9') {
                 const tagIndex = parseInt(e.key) - 1;
                 if (tagIndex < PREDEFINED_TAGS.length) {
                     toggleTag(PREDEFINED_TAGS[tagIndex].id);
@@ -3313,7 +3326,7 @@ def main():
     print(f"  S      Sauvegarder les corrections")
     print(f"  F      Filtrer les non-validés")
     print(f"  T      Focus sur le champ tag personnalisé")
-    print(f"  1-8    Toggle tag rapide")
+    print(f"  1-9    Toggle tag rapide")
     print(f"\nTags disponibles:")
     for tag in PREDEFINED_TAGS:
         print(f"  {tag['shortcut']}  {tag['label']}")
