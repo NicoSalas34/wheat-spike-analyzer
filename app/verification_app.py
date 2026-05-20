@@ -56,7 +56,8 @@ app = Flask(__name__)
 
 # Variables globales
 RESULTS_DIR = None
-RESULTS_CACHE = {}
+RESULTS_CACHE = {}  # image_id -> full result dict
+RESULTS_LIST = None  # cached list of full results (None = not loaded yet)
 CORRECTIONS_FILE = None
 
 # Tags prédéfinis pour les problèmes
@@ -79,28 +80,30 @@ PREDEFINED_TAGS = [
 
 
 def load_all_results() -> List[Dict]:
-    """Charge tous les résultats depuis le dossier output"""
-    global RESULTS_CACHE
-    
+    """Charge tous les résultats depuis le dossier output (avec cache mémoire)."""
+    global RESULTS_CACHE, RESULTS_LIST
+
+    if RESULTS_LIST is not None:
+        return RESULTS_LIST
+
     results = []
     results_dir = Path(RESULTS_DIR)
 
     if not results_dir.exists():
         RESULTS_CACHE = {}
+        RESULTS_LIST = []
         return results
-    
+
     for source_index, results_file in enumerate(sorted(results_dir.glob('**/results.json'))):
         try:
             with open(results_file, 'r') as f:
                 data = json.load(f)
-            
-            # Ajouter le chemin du dossier de session
+
             session_dir = results_file.parent
             data['_session_dir'] = str(session_dir)
             data['_results_file'] = str(results_file)
             data['_source_index'] = source_index
-            
-            # Charger la vérification existante si présente
+
             if '_verification' in data:
                 data['_corrections'] = {
                     'status': data['_verification'].get('status', 'pending'),
@@ -109,15 +112,21 @@ def load_all_results() -> List[Dict]:
                 }
             else:
                 data['_corrections'] = {'status': 'pending', 'tags': []}
-            
+
             results.append(data)
         except Exception as e:
             logger.warning(f"Erreur chargement {results_file}: {e}")
-    
-    # Mettre en cache
+
     RESULTS_CACHE = {Path(r['image']).stem: r for r in results}
-    
+    RESULTS_LIST = results
     return results
+
+
+def invalidate_results_cache():
+    """Invalide le cache mémoire des résultats (à appeler après toute écriture)."""
+    global RESULTS_CACHE, RESULTS_LIST
+    RESULTS_CACHE = {}
+    RESULTS_LIST = None
 
 
 def save_correction(image_id: str, corrections: Dict) -> bool:
@@ -1965,10 +1974,24 @@ HTML_TEMPLATE = """
         });
         // ===== END ZOOM =====
         
-        function displayResult(index) {
+        async function displayResult(index) {
             if (index < 0 || index >= filteredResults.length) return;
-            
-            const result = filteredResults[index];
+
+            let result = filteredResults[index];
+
+            // Charger les détails complets si pas encore disponibles (résumé seul)
+            if (result.spikes === undefined) {
+                try {
+                    const resp = await fetch('/api/result?session_dir=' + encodeURIComponent(result._session_dir));
+                    if (resp.ok) {
+                        const full = await resp.json();
+                        Object.assign(result, full);
+                    }
+                } catch (e) {
+                    console.error('Erreur chargement détails:', e);
+                }
+            }
+
             const corrections = result._corrections || {};
             
             // Image (request image via query param to avoid path encoding issues)
@@ -2632,9 +2655,34 @@ def api_tags():
 
 @app.route('/api/results')
 def api_results():
-    """Retourne tous les résultats"""
+    """Retourne un résumé léger de tous les résultats (sans données de spikes)."""
     results = load_all_results()
-    return jsonify(results)
+    summary = [
+        {
+            'image': r['image'],
+            '_session_dir': r['_session_dir'],
+            '_results_file': r['_results_file'],
+            '_source_index': r['_source_index'],
+            '_corrections': r.get('_corrections', {'status': 'pending', 'tags': []}),
+            'spike_count': r.get('spike_count', len(r.get('spikes', []))),
+            'bag': r.get('bag'),
+        }
+        for r in results
+    ]
+    return jsonify(summary)
+
+
+@app.route('/api/result')
+def api_result():
+    """Retourne les données complètes d'un résultat (paramètre query: session_dir)."""
+    session_dir = request.args.get('session_dir')
+    if not session_dir:
+        return jsonify({'error': 'session_dir manquant'}), 400
+    results = load_all_results()
+    for r in results:
+        if r['_session_dir'] == session_dir:
+            return jsonify(r)
+    return jsonify({'error': 'Résultat non trouvé'}), 404
 
 
 @app.route('/api/image')
@@ -2827,6 +2875,8 @@ def api_apply_csv_back_modifications():
             f"sample_cleared={summary.get('sample_id_cleared', 0)} dry_run={dry_run}"
         )
 
+        if not dry_run:
+            invalidate_results_cache()
         return jsonify({'success': True, **summary})
 
     except ValueError as e:
@@ -2869,7 +2919,7 @@ def api_delete_current_session_dir():
 
     try:
         shutil.rmtree(session_path)
-        RESULTS_CACHE = {}
+        invalidate_results_cache()
         logger.info(f"Sous-répertoire de session supprimé: {session_path}")
         return jsonify({'success': True, 'deleted': True, 'path': str(session_path)})
     except Exception as e:
@@ -3295,8 +3345,8 @@ def main():
                         help='Dossier contenant les résultats (défaut: output)')
     parser.add_argument('--port', '-p', type=int, default=5000,
                         help='Port du serveur (défaut: 5000)')
-    parser.add_argument('--host', default='127.0.0.1',
-                        help='Adresse du serveur (défaut: 127.0.0.1)')
+    parser.add_argument('--host', default='0.0.0.0',
+                        help='Adresse du serveur (défaut: 0.0.0.0)')
     parser.add_argument('--debug', action='store_true',
                         help='Mode debug Flask')
     
