@@ -86,6 +86,7 @@ Thumbs.db
 # ── Temporary / training data ────────────────────────────────────────────────
 tmp/
 verification/
+trainings/
 
 # ── AI instructions (internal) ───────────────────────────────────────────────
 .ai-instructions.md

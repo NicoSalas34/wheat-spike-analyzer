@@ -1,0 +1,16 @@
+type: yolo11_pose
+name: rachis_yolo_pose-r20260521
+provider: Ultralytics
+display_name: Rachis Yolo Pose
+model_path: /home/salas/Documents/Git/wheat-spike-analyzer/models/rachis_yolo_pose.onnx
+conf_threshold: 0.25
+iou_threshold: 0.45
+kpt_threshold: 0.25
+has_visible: true
+classes:
+  rachis:
+  - kpt0
+  - kpt1
+  - kpt2
+  - kpt3
+  - kpt4

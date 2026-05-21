@@ -1,0 +1,10 @@
+type: yolo26_seg
+name: rachis_yolo-r20260521
+provider: Ultralytics
+display_name: Rachis Yolo
+model_path: /home/salas/Documents/Git/wheat-spike-analyzer/models/rachis_yolo.onnx
+conf_threshold: 0.25
+iou_threshold: 0.45
+max_det: 300
+classes:
+- rachis

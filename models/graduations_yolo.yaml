@@ -1,0 +1,12 @@
+type: yolo11_obb
+name: graduations_yolo-r20260521
+provider: Ultralytics
+display_name: Graduations Yolo
+model_path: /home/salas/Documents/Git/wheat-spike-analyzer/models/graduations_yolo.onnx
+conf_threshold: 0.25
+iou_threshold: 0.45
+classes:
+- '0'
+- '10'
+- '20'
+- '30'

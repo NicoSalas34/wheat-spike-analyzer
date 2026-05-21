@@ -1,0 +1,13 @@
+type: yolo26_obb
+name: wheat_spike_yolo-r20260521
+provider: Ultralytics
+display_name: Wheat Spike Yolo
+model_path: /home/salas/Documents/Git/wheat-spike-analyzer/models/wheat_spike_yolo.onnx
+conf_threshold: 0.25
+iou_threshold: 0.45
+max_det: 300
+classes:
+- ruler
+- spike
+- bag
+- whole_spike
