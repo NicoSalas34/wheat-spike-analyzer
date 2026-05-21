@@ -20,7 +20,7 @@ from ultralytics import YOLO
 MODEL = "yolo26l-seg.pt"
 
 # Dataset
-DATA = "training_rachis/data.yaml"
+DATA = "trainings/training_rachis/data.yaml"
 
 # Hyperparamètres d'entraînement
 EPOCHS = 500
@@ -34,7 +34,7 @@ WORKERS = 8
 AMP = True
 
 # Sortie
-PROJECT = "runs/"
+PROJECT = "runs"
 NAME = "rachis_yolo26l_seg"
 EXIST_OK = True
 

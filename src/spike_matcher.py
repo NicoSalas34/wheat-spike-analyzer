@@ -233,6 +233,92 @@ def match_spikes_hungarian(
     return pairs
 
 
+def recover_merged_whole_spikes(
+    pairs: List[Tuple[Optional[int], Optional[int]]],
+    spikes: List,
+    whole_spikes: List,
+    min_containment_orphan: float = 0.40,
+    max_proximity_ratio: float = 1.0,
+) -> List[Tuple[Optional[int], Optional[int]]]:
+    """
+    Phase 2 du matching : récupère les spikes orphelins qui sont collés à un
+    spike déjà apparié sous le même whole_spike fusionné par YOLO.
+
+    Cas typique : 2 épis proches → YOLO produit un seul whole_spike englobant.
+    Le Hungarian assigne le meilleur spike ; l'autre reste orphelin.
+    Cette fonction détecte ce cas et duplique le whole_spike pour le second spike.
+
+    Conditions de récupération pour un orphelin (sp_idx sans ws) :
+      1. Il existe une paire appariée (ws_idx, sp_idx2) telle que :
+         a. containment(orphelin, whole_spikes[ws_idx]) >= min_containment_orphan
+         b. distance(centres orphelin et spike apparié) / max(ws.w, ws.h) <= max_proximity_ratio
+      2. On retient le whole_spike candidat avec le meilleur containment.
+
+    Le whole_spike est partagé par référence (pas copié) : toutes les mesures
+    en aval sont read-only sur ws_det.
+
+    Args:
+        pairs: Résultat de match_spikes_hungarian
+        spikes: Liste OBBDetection spikes
+        whole_spikes: Liste OBBDetection whole_spikes
+        min_containment_orphan: Containment minimum de l'orphelin dans le ws candidat
+        max_proximity_ratio: Distance inter-centres / taille ws max autorisée
+
+    Returns:
+        Nouvelle liste de paires avec les orphelins récupérés intégrés.
+    """
+    # Séparer les paires appariées des orphelins
+    matched_pairs = [(ws, sp) for ws, sp in pairs if ws is not None and sp is not None]
+    orphan_spikes = [sp for ws, sp in pairs if ws is None and sp is not None]
+    unmatched_ws  = [ws for ws, sp in pairs if ws is not None and sp is None]
+
+    if not orphan_spikes or not matched_pairs:
+        return pairs
+
+    recovered = []
+    still_orphan = []
+
+    for orphan_sp_idx in orphan_spikes:
+        orphan = spikes[orphan_sp_idx]
+        best_ws_idx = None
+        best_score  = -1.0
+
+        for ws_idx, sp_idx in matched_pairs:
+            ws = whole_spikes[ws_idx]
+            paired_sp = spikes[sp_idx]
+
+            # Condition a : l'orphelin est suffisamment contenu dans ce ws
+            containment = compute_containment_score(orphan, ws)
+            if containment < min_containment_orphan:
+                continue
+
+            # Condition b : les deux spikes sont proches l'un de l'autre
+            ocx, ocy = orphan.center
+            pcx, pcy = paired_sp.center
+            dist = ((ocx - pcx) ** 2 + (ocy - pcy) ** 2) ** 0.5
+            ws_size = max(ws.width, ws.height)
+            if ws_size <= 0 or dist / ws_size > max_proximity_ratio:
+                continue
+
+            if containment > best_score:
+                best_score  = containment
+                best_ws_idx = ws_idx
+
+        if best_ws_idx is not None:
+            recovered.append((best_ws_idx, orphan_sp_idx))
+            logger.info(
+                f"  [merge-recovery] spike[{orphan_sp_idx}] récupéré "
+                f"→ whole_spike[{best_ws_idx}] (containment={best_score:.2f})"
+            )
+        else:
+            still_orphan.append((None, orphan_sp_idx))
+
+    if recovered:
+        logger.info(f"  [merge-recovery] {len(recovered)} spike(s) récupéré(s) sur {len(orphan_spikes)} orphelins")
+
+    return matched_pairs + [(ws, None) for ws in unmatched_ws] + still_orphan + recovered
+
+
 def _greedy_matching(
     spikes: List,
     whole_spikes: List,

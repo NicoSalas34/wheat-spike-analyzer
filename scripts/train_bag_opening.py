@@ -20,7 +20,7 @@ from ultralytics import YOLO
 MODEL = "yolo26n.pt"
 
 # Dataset
-DATA = "training_bag_opening/data.yaml"
+DATA = "trainings/training_bag_opening/data.yaml"
 
 # Hyperparamètres d'entraînement
 EPOCHS = 300
@@ -34,7 +34,7 @@ WORKERS = 8
 AMP = True
 
 # Sortie
-PROJECT = "runs/"
+PROJECT = "runs"
 NAME = "bag_opening_yolo26n"
 EXIST_OK = True
 

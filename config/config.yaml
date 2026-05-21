@@ -183,6 +183,10 @@ segmentation:
 spike_matching:
   min_iou: 0.01                 # IoU minimum pour valider un appariement (bas car whole_spike >> spike)
   min_containment: 0.3          # Score de containment minimum (spike dans whole_spike)
+  merge_recovery:
+    enabled: true
+    min_containment_orphan: 0.40  # Containment min de l'orphelin dans le whole_spike candidat
+    max_proximity_ratio: 1.0      # Distance inter-centres / taille ws max (épis collés)
 
 # =============================================================================
 # IDENTIFICATION DES SACHETS (OCR)

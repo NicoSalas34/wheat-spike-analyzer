@@ -23,9 +23,9 @@ from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 
 try:
-    from .spike_matcher import match_spikes_hungarian
+    from .spike_matcher import match_spikes_hungarian, recover_merged_whole_spikes
 except ImportError:
-    from spike_matcher import match_spikes_hungarian
+    from spike_matcher import match_spikes_hungarian, recover_merged_whole_spikes
 
 try:
     from .spike_segmenter import SpikeSegmenter
@@ -4288,7 +4288,18 @@ class WheatSpikeAnalyzerOBB:
                 min_iou=self.matching_min_iou,
                 min_containment=self.matching_min_containment,
             )
-            
+
+            # Phase 2 : récupération des orphelins sous whole_spike fusionné
+            merge_cfg = self.config.get('spike_matching', {}).get('merge_recovery', {})
+            if merge_cfg.get('enabled', True):
+                pairs = recover_merged_whole_spikes(
+                    pairs=pairs,
+                    spikes=detections['spikes'],
+                    whole_spikes=detections['whole_spikes'],
+                    min_containment_orphan=merge_cfg.get('min_containment_orphan', 0.40),
+                    max_proximity_ratio=merge_cfg.get('max_proximity_ratio', 1.0),
+                )
+
             # Construire la liste all_spike_dets à partir des paires
             all_spike_dets = []
             for ws_idx, sp_idx in pairs:

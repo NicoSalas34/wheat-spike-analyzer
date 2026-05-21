@@ -20,7 +20,7 @@ from ultralytics import YOLO
 MODEL = "yolo26x-seg.pt"
 
 # Dataset
-DATA = "training_spikelets_segmentation/data.yaml"
+DATA = "trainings/training_spikelets_segmentation/data.yaml"
 
 # Hyperparamètres d'entraînement
 EPOCHS = 500
@@ -34,7 +34,7 @@ WORKERS = 8
 AMP = True
 
 # Sortie
-PROJECT = "runs/"
+PROJECT = "runs"
 NAME = "spikelets_yolo26s_seg"
 EXIST_OK = True
 

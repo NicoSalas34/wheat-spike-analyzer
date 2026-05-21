@@ -6,7 +6,7 @@ Usage:
     python scripts/train_rachis_pose.py
     python scripts/train_rachis_pose.py --resume
     python scripts/train_rachis_pose.py --epochs 300 --batch 8 --imgsz 960
-    python scripts/train_rachis_pose.py --data training_rachis_pose/data.yaml
+    python scripts/train_rachis_pose.py --data trainings/training_rachis_pose/data.yaml
 """
 
 import argparse
@@ -21,7 +21,7 @@ from ultralytics import YOLO
 MODEL = "yolo11n-pose.pt"
 
 # Dataset pose (doit contenir kpt_shape et flip_idx)
-DATA = "training_rachis_pose/data.yaml"
+DATA = "trainings/training_rachis_pose/data.yaml"
 
 # Hyperparamètres d'entraînement
 EPOCHS = 250
@@ -34,7 +34,7 @@ DEVICE = 0
 WORKERS = 8
 
 # Sortie
-PROJECT = "runs/"
+PROJECT = "runs"
 NAME = "rachis_yolo11n_pose"
 EXIST_OK = True
 
