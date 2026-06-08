@@ -17,7 +17,7 @@ Pipeline complet en **10 étapes** pour l'analyse automatisée d'images d'épis 
 5. **Segmentation des épis** — YOLO-Seg pixel-level avec TTA (vote majoritaire sur masques)
 6. **Comptage des épillets** — Modèle YOLO dédié avec déduplication et TTA
 7. **Segmentation des épillets** — YOLO-Seg instance segmentation (taille, forme, aire par épillet)
-8. **Rachis et angles d'insertion** — YOLO-Seg rachis + calcul des angles d'insertion des épillets
+8. **Rachis et angles d'insertion** — YOLO-Pose rachis (5 keypoints, ligne médiane) + calcul des angles d'insertion des épillets (mode YOLO-Seg en fallback)
 9. **OCR sachets** — Identification automatique bac-ligne-colonne (chiffres 1-20) avec orientation du sachet
 10. **Export** — JSON structuré + CSV résumé (~80+ colonnes) + images de debug
 
@@ -36,7 +36,7 @@ Pipeline complet en **10 étapes** pour l'analyse automatisée d'images d'épis 
 ### Comptage et analyse fine
 - **Comptage d'épillets** avec niveaux de confiance (haute ≥10, moyenne ≥5, basse <5)
 - **Segmentation individuelle** des épillets (aire, forme)
-- **Rachis** : segmentation de l'axe central + angles d'insertion des épillets
+- **Rachis** : ligne médiane via YOLO-Pose (5 keypoints) + angles d'insertion des épillets
 
 ### OCR et identification
 - **Chiffres 1-20** sur sachets d'échantillons → format bac-ligne-colonne
@@ -44,8 +44,8 @@ Pipeline complet en **10 étapes** pour l'analyse automatisée d'images d'épis 
 
 ### Test-Time Augmentation (TTA)
 TTA configurable par étape avec vote majoritaire / consensus :
-- Segmentation épis, comptage épillets, rachis, OCR sachets
-- Augmentations : flip_h, flip_v, rot180, brightness_up, contrast_up
+- Détection OBB principale (mode `custom` avec consensus OBB), segmentation épis, comptage épillets, rachis, OCR sachets
+- Jusqu'à 11 augmentations : original, flip_h, flip_v, rot180, brightness_up/down, contrast_up/down, hue_shift, saturation_up/down
 
 ### Export et vérification
 - **JSON** : résultats structurés complets par image
@@ -96,6 +96,7 @@ pip install -r requirements.txt
 
 ```bash
 # Tester sur les 3 images incluses dans le repo
+# (data/test_sample/ : GOPR5380.jpg, GOPR5627.jpg, GOPR5764.jpg)
 python src/main.py data/test_sample/ --batch --low-debug
 ```
 
@@ -154,7 +155,7 @@ analyzer = create_analyzer_from_config(
 )
 
 # Analyser une image
-result = analyzer.analyze_image("data/raw/GOPR2587.JPG")
+result = analyzer.analyze_image("data/test_sample/GOPR5380.jpg")
 
 # Accéder aux résultats
 print(f"Épis détectés: {result['spike_count']}")
@@ -248,21 +249,31 @@ wheat-spike-analyzer/
 ├── app/
 │   └── verification_app.py          # Application web Flask de vérification
 │
-├── models/                          # Modèles YOLO pré-entraînés (Git LFS, ~290 MB)
+├── models/                          # Modèles YOLO pré-entraînés (.pt via Git LFS)
 │   ├── wheat_spike_yolo.pt          # OBB : ruler, spike, bag, whole_spike
 │   ├── graduations_yolo.pt          # OBB : graduations 0/10/20/30 cm
-│   ├── spikelets_yolo.pt            # Détection/comptage épillets (YOLO-Seg)
+│   ├── spikelets_yolo.pt            # Segmentation/comptage épillets (YOLO-Seg)
 │   ├── spike_seg_yolo.pt            # Segmentation épis (YOLO-Seg)
-│   ├── rachis_yolo.pt               # Segmentation rachis (YOLO-Seg)
+│   ├── rachis_yolo_pose.pt          # Rachis (YOLO-Pose, 5 keypoints) — mode par défaut
+│   ├── rachis_yolo.pt               # Rachis (YOLO-Seg) — mode fallback
 │   ├── bag_digits_yolo.pt           # OCR chiffres 1-20
-│   └── bag_opening_yolo.pt          # Orientation sachet
+│   ├── bag_opening_yolo.pt          # Orientation sachet
+│   ├── *.onnx                       # Exports ONNX (pré-annotation X-AnyLabeling)
+│   ├── *.yaml                       # Configs X-AnyLabeling associées
+│   └── README.md                    # Détail des modèles et datasets
 │
 ├── scripts/                         # Scripts utilitaires (entraînement, conversion)
 │   ├── train_spike.py               # Entraînement OBB (yolo26s-obb)
 │   ├── train_spike_seg.py           # Entraînement segmentation épis
 │   ├── train_spikelet_seg.py        # Entraînement segmentation épillets
-│   ├── train_rachis.py              # Entraînement rachis
-│   └── ...                          # Conversion annotations, pré-annotation, etc.
+│   ├── train_rachis.py              # Entraînement rachis (YOLO-Seg)
+│   ├── train_rachis_pose.py         # Entraînement rachis (YOLO-Pose)
+│   ├── train_bag_opening.py         # Entraînement orientation sachet
+│   ├── build_rachis_pose_dataset.py # Construction dataset rachis pose (keypoints)
+│   ├── xanylabeling_to_yolo_obb*.py # Conversion annotations X-AnyLabeling → YOLO
+│   ├── export_xanylabeling_configs.py # Génération des configs/ONNX X-AnyLabeling
+│   ├── collect_results_csv.py       # Agrégation CSV des résultats
+│   └── ...                          # Pré-annotation, augmentation, etc.
 │
 ├── data/
 │   ├── test_sample/                 # 3 images de test incluses dans le repo
@@ -285,17 +296,23 @@ wheat-spike-analyzer/
 
 ## Modèles YOLO
 
-7 modèles spécialisés, stockés via Git LFS dans `models/` :
+8 modèles spécialisés. Les poids `.pt` sont stockés via Git LFS dans `models/` ;
+chaque modèle dispose aussi d'un export `.onnx` et d'une config `.yaml` pour la
+pré-annotation dans X-AnyLabeling. Voir `models/README.md` pour le détail.
 
 | Modèle | Type | Classes | Architecture de base | Usage |
 |--------|------|---------|---------------------|-------|
 | `wheat_spike_yolo.pt` | OBB | ruler, spike, bag, whole_spike | yolo26s-obb | Détection principale |
 | `graduations_yolo.pt` | OBB | 0cm, 10cm, 20cm, 30cm | — | Calibration par graduations |
-| `spikelets_yolo.pt` | Detect | spikelet | — | Comptage des épillets |
+| `spikelets_yolo.pt` | Segment | spikelet | yolo26-seg | Comptage + segmentation des épillets |
 | `spike_seg_yolo.pt` | Segment | spike | yolo26s-seg | Segmentation pixel-level des épis |
-| `rachis_yolo.pt` | Segment | rachis | yolo26l-seg | Segmentation de l'axe central |
+| `rachis_yolo_pose.pt` | Pose | rachis (5 keypoints) | yolo11-pose | Ligne médiane du rachis (par défaut) |
+| `rachis_yolo.pt` | Segment | rachis | yolo26l-seg | Rachis en mode segmentation (fallback) |
 | `bag_digits_yolo.pt` | Detect | 1-20 | — | OCR chiffres sur sachets |
-| `bag_opening_yolo.pt` | Detect | bag_opening | — | Orientation du sachet |
+| `bag_opening_yolo.pt` | Detect | bag_opening | yolo26 | Orientation du sachet |
+
+> Le mode rachis est piloté par `rachis_detection.task` dans la config
+> (`auto`/`pose`/`segment`). En mode `pose`, le pipeline charge `rachis_yolo_pose.pt`.
 
 ---
 
@@ -313,7 +330,7 @@ L'analyseur génère des images de debug dans `output/<image>/debug/` :
 | `05_final_result.png` | 10 | Résultat final annoté |
 | `05b_segmentation.png` | 5 | Segmentation YOLO-Seg des épis |
 | `06_spikelets.png` | 6-7 | Segmentation individuelle des épillets |
-| `07_rachis.png` | 8 | Détection du rachis |
+| `07_rachis.png` | 8 | Détection du rachis (YOLO-Pose / YOLO-Seg) |
 | `08_insertion_angles.png` | 8 | Angles d'insertion des épillets |
 
 ---
@@ -326,10 +343,18 @@ Le fichier `config/config.yaml` contrôle l'intégralité du pipeline :
 # Détection OBB principale
 yolo:
   model_path: 'models/wheat_spike_yolo.pt'
-  confidence_threshold: 0.35
+  confidence_threshold: 0.2
   iou_threshold: 0.45
+  ruler_confidence_threshold: 0.15
   tta:
-    enabled: false
+    enabled: true
+    mode: 'custom'          # 'custom' (consensus OBB, recommandé) | 'native'
+  sliced_inference:
+    enabled: false          # Inférence par tuiles pour images haute résolution
+  spike_refinement:
+    enabled: false          # Raffinement spike via consensus détection/segmentation
+  detection_verification:
+    enabled: true           # Filtres géométriques post-détection (anti faux positifs)
 
 # Calibration (graduations sur la règle)
 graduation_detection:
@@ -351,13 +376,21 @@ segmentation:
   tta:
     enabled: true
 
-# Rachis (avec TTA)
+# Rachis (YOLO-Pose par défaut, avec TTA)
 rachis_detection:
   enabled: true
-  model_path: 'models/rachis_yolo.pt'
+  task: 'auto'                          # 'auto' | 'pose' | 'segment'
+  model_path: 'models/rachis_yolo.pt'   # utilisé en mode segment
+  pose_model_path: 'models/rachis_yolo_pose.pt'  # utilisé en mode pose
   tta:
     enabled: true
     consensus_threshold: 0.4
+
+# Appariement spike ↔ whole_spike (algorithme hongrois, IoU OBB)
+spike_matching:
+  min_iou: 0.01
+  merge_recovery:
+    enabled: true            # Récupération des épis collés / orphelins
 
 # OCR sachets (avec TTA)
 bag_digits:
@@ -390,17 +423,20 @@ Options utiles :
 Les datasets d'entraînement ne sont pas inclus dans le dépôt (trop volumineux). Pour ré-entraîner les modèles :
 
 1. Préparer un dossier `training_<task>/` avec `data.yaml`, `images/` et `labels/`
-2. Annoter dans X-AnyLabeling
-3. Convertir les annotations (`scripts/add_annotations_to_dataset.py`)
+2. Annoter dans X-AnyLabeling (les configs/ONNX de pré-annotation sont générés par
+   `scripts/export_xanylabeling_configs.py`)
+3. Convertir les annotations (`scripts/xanylabeling_to_yolo_obb*.py`, `scripts/add_annotations_to_dataset.py`)
 4. Entraîner avec Ultralytics (`scripts/train_*.py`)
 
 Scripts d'entraînement dans `scripts/` :
 
 ```bash
-python scripts/train_spike.py          # OBB (yolo26s-obb, 500 epochs, batch 16, imgsz 1024)
-python scripts/train_spike_seg.py      # Segmentation épis (yolo26s-seg, 500 epochs, batch 12)
-python scripts/train_spikelet_seg.py   # Segmentation épillets (yolo26x-seg, 500 epochs, batch 8)
-python scripts/train_rachis.py         # Rachis (yolo26l-seg, 500 epochs, batch 8, 180° rotation)
+python scripts/train_spike.py          # OBB (yolo26s-obb)
+python scripts/train_spike_seg.py      # Segmentation épis (yolo26s-seg)
+python scripts/train_spikelet_seg.py   # Segmentation épillets (yolo26-seg)
+python scripts/train_rachis_pose.py    # Rachis YOLO-Pose (5 keypoints) — modèle par défaut
+python scripts/train_rachis.py         # Rachis YOLO-Seg (mode fallback)
+python scripts/train_bag_opening.py    # Orientation sachet
 ```
 
 ---

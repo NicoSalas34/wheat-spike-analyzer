@@ -147,7 +147,7 @@ spikelet_counting:
       - hue_shift
       - saturation_up
       - saturation_down
-  segmentation:                 # Segmentation individuelle des épillets via SAM2
+  segmentation:                 # Segmentation individuelle des épillets via YOLO-Seg (spikelets_yolo.pt)
     enabled: true               # Activer pour obtenir taille/forme/aire par épillet
 
 # =============================================================================
@@ -287,7 +287,7 @@ debug:
   # 05_final_result.png      - Résultat final annoté
   # 05b_segmentation.png     - Segmentation YOLO-Seg des épis
   # 06_spikelets.png         - Segmentation individuelle des épillets
-  # 07_rachis.png            - Détection du rachis (YOLO-Seg)
+  # 07_rachis.png            - Détection du rachis (YOLO-Pose / YOLO-Seg)
   # 08_insertion_angles.png  - Angles d'insertion des épillets
 
 # =============================================================================
